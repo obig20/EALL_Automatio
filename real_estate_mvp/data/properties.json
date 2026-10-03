@@ -1,0 +1,54 @@
+{
+  "_notice": {
+    "data_classification": "DEMO DATA ONLY — every property and value below is synthetic.",
+    "use_for_live_sales": false
+  },
+  "bole_apartment_2bed": {
+    "name": "Bole 2 Bedroom Apartment",
+    "property_type": "Apartment",
+    "bedrooms": 2,
+    "price": "12,000,000 ETB",
+    "location": "Bole, near Atlas",
+    "payment_plan": "30% downpayment, balance over 24 months",
+    "availability": "3 demo units remaining",
+    "amenities": ["24-hour security", "elevator"],
+    "promotions": [],
+    "completion_date": null
+  },
+  "bole_apartment_3bed": {
+    "name": "Bole 3 Bedroom Apartment",
+    "property_type": "Apartment",
+    "bedrooms": 3,
+    "price": "18,000,000 ETB",
+    "location": "Bole, near Atlas",
+    "payment_plan": "35% downpayment, balance over 24 months",
+    "availability": "2 demo units remaining",
+    "amenities": ["24-hour security", "elevator"],
+    "promotions": [],
+    "completion_date": null
+  },
+  "summit_villa": {
+    "name": "Summit Family Villa",
+    "property_type": "Villa",
+    "bedrooms": 4,
+    "price": "28,500,000 ETB",
+    "location": "Summit, Addis Ababa",
+    "payment_plan": "40% downpayment, balance over 18 months",
+    "availability": "1 demo unit remaining",
+    "amenities": ["private garden", "covered parking"],
+    "promotions": [],
+    "completion_date": null
+  },
+  "kazanchis_apartment": {
+    "name": "Kazanchis 1 Bedroom Apartment",
+    "property_type": "Apartment",
+    "bedrooms": 1,
+    "price": "9,200,000 ETB",
+    "location": "Kazanchis, Addis Ababa",
+    "payment_plan": "30% downpayment, balance over 24 months",
+    "availability": "4 demo units remaining",
+    "amenities": ["elevator"],
+    "promotions": [],
+    "completion_date": null
+  }
+}

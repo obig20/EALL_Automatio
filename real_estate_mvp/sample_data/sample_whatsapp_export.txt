@@ -1,0 +1,13 @@
+02/10/2026, 08:30 - Buyer: Hi, I am interested in the Bole apartment.
+02/10/2026, 08:32 - Buyer: Could you also share the payment plan?
+02/10/2026, 08:38 - Agent: The payment plan is available in the demo data.
+02/10/2026, 09:00 - Buyer: Is the two-bedroom apartment available?
+02/10/2026, 09:05 - Agent: Yes, the demo listing shows units remaining.
+02/10/2026, 10:00 - Buyer: What is the price of the Bole apartment?
+02/10/2026, 10:25 - Sales: The sample price is in the demo property sheet.
+02/10/2026, 11:00 - Buyer: Can I get the payment terms?
+02/10/2026, 18:15 - Buyer: Hello, is there a villa in Summit?
+02/10/2026, 19:00 - Agent: The demo Summit villa listing is available for discussion.
+02/10/2026, 22:10 - Buyer: Does the apartment have parking?
+04/10/2026, 12:00 - Buyer: Is the property located near the main road?
+04/10/2026, 12:30 - Admin: I will check the synthetic listing and reply.
