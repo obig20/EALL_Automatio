@@ -47,3 +47,21 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# ============================================================================
+# ASTER runtime state — buyer data must never be committed.
+# Static demo data (properties.json) stays tracked; live state does not.
+# ============================================================================
+
+# Secrets — never commit credentials
+.env
+.env.*
+!.env.example
+
+# ASTER runtime/PII state (inquiries, event log, generated reports)
+real_estate_mvp/data/inquiries.jsonl
+real_estate_mvp/data/events.jsonl
+real_estate_mvp/data/mock/
+real_estate_mvp/data/live/
+real_estate_mvp/reports/*.json
+!real_estate_mvp/reports/.gitkeep

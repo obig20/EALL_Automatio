@@ -97,7 +97,18 @@ class ReviewQueue:
     def __init__(self, store: JSONLStore, founder_chat_id: str | int):
         self.store = store
         self.founder_chat_id = str(founder_chat_id)
-        self._lock = asyncio.Lock()
+        # Per-inquiry locks: a slow or retrying send for one inquiry must
+        # not block unrelated founder actions on other inquiries. All
+        # methods run on a single event loop, so the dict access below
+        # never interleaves between the get and the set.
+        self._inquiry_locks: dict[str, asyncio.Lock] = {}
+
+    def _inquiry_lock(self, inquiry_id: str) -> asyncio.Lock:
+        lock = self._inquiry_locks.get(inquiry_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._inquiry_locks[inquiry_id] = lock
+        return lock
 
     def is_founder(self, actor_user_id: str | int | None, chat_id: str | int | None) -> bool:
         # The supported founder destination is a private Telegram chat: both values
@@ -192,7 +203,7 @@ class ReviewQueue:
         chat_id: str | int | None,
         send_message: SendFunction,
     ) -> dict[str, Any]:
-        async with self._lock:
+        async with self._inquiry_lock(inquiry_id):
             if not self._authorize(actor_user_id, chat_id, "approve"):
                 return {"ok": False, "status": "unauthorized"}
             inquiry = self.store.get_inquiry(inquiry_id)
@@ -228,7 +239,7 @@ class ReviewQueue:
         actor_user_id: str | int | None,
         chat_id: str | int | None,
     ) -> dict[str, Any]:
-        async with self._lock:
+        async with self._inquiry_lock(inquiry_id):
             if not self._authorize(actor_user_id, chat_id, "reject"):
                 return {"ok": False, "status": "unauthorized"}
             inquiry = self.store.get_inquiry(inquiry_id)
@@ -262,7 +273,7 @@ class ReviewQueue:
         chat_id: str | int | None,
     ) -> dict[str, Any]:
         """Record a founder's inspection of a send interrupted in the `sending` state."""
-        async with self._lock:
+        async with self._inquiry_lock(inquiry_id):
             if not self._authorize(actor_user_id, chat_id, "resolve_send"):
                 return {"ok": False, "status": "unauthorized"}
             if outcome not in {"delivered", "not_delivered"}:
@@ -328,7 +339,7 @@ class ReviewQueue:
         chat_id: str | int | None,
         send_message: SendFunction,
     ) -> dict[str, Any]:
-        async with self._lock:
+        async with self._inquiry_lock(inquiry_id):
             if not self._authorize(actor_user_id, chat_id, "manual_send"):
                 return {"ok": False, "status": "unauthorized"}
             if not text or not text.strip():

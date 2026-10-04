@@ -36,6 +36,7 @@ def _print_pending(store: JSONLStore) -> None:
 async def _mock_console(settings, store: JSONLStore) -> None:
     queue = ReviewQueue(store, founder_chat_id="local-founder")
     print("ASTER mock console — synthetic data only; no external calls.")
+    print(f"Mock runtime data directory: {store.data_dir}")
     print(
         "Enter a buyer message, /pending, /approve ID, /reject ID, "
         "/send ID TEXT, /resolve_send ID delivered|not_delivered, or /exit."
@@ -143,6 +144,19 @@ def main() -> None:
 
     settings = get_settings()
     store = JSONLStore(settings.data_dir)
+    if settings.mock_points_at_live_data:
+        logger.warning(
+            "[CONFIG] MOCK MODE IS POINTED AT THE LIVE DATA DIRECTORY (%s). "
+            "This requires an explicit DATA_DIR/MOCK_DATA_DIR override.",
+            settings.data_dir,
+        )
+    else:
+        logger.info(
+            "[CONFIG] mode=%s runtime_data=%s properties=%s",
+            "mock" if settings.mock_mode else "live",
+            settings.data_dir,
+            settings.properties_file,
+        )
     if args.pending:
         _print_pending(store)
         return

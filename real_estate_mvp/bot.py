@@ -23,12 +23,18 @@ from .config import Settings
 from .draft import DraftGenerationError, generate_draft
 from .knowledge import find_relevant_properties, get_property_context
 from .queue import ReviewQueue, format_review_message
+from .ratelimit import RateLimiter
 from .retry import with_transient_retry_async
-from .storage import JSONLStore
+from .storage import DuplicateInquiryError, JSONLStore
 from .utils import BUSINESS_TZ, clip_text
 
 logger = logging.getLogger(__name__)
 BUYER_ACK = "Thanks for your inquiry. Your message has been received and is being reviewed."
+RATE_LIMITED_ACK = (
+    "Thanks for your interest. We are receiving many messages from you "
+    "right now. Please wait a few minutes before sending again, or contact "
+    "our office directly."
+)
 MAX_DRAFT_INPUT_CHARS = 4000
 
 
@@ -75,17 +81,34 @@ async def prepare_inquiry(
     telegram_message_id: int | str | None,
     message: str,
     received_at: str | None = None,
+    telegram_chat_id: int | str | None = None,
 ) -> dict[str, Any]:
     """Persist first, then perform deterministic matching and draft generation."""
     if not isinstance(message, str) or not message.strip():
         raise ValueError("Buyer message must contain text")
 
-    inquiry = store.create_inquiry(
-        telegram_user_id=telegram_user_id,
-        telegram_message_id=telegram_message_id,
-        message=message,
-        received_at=received_at,
-    )
+    try:
+        inquiry = store.create_inquiry(
+            telegram_user_id=telegram_user_id,
+            telegram_message_id=telegram_message_id,
+            message=message,
+            received_at=received_at,
+            telegram_chat_id=telegram_chat_id,
+        )
+    except DuplicateInquiryError as exc:
+        # Telegram redelivered a message that is already durable: do not
+        # create a second record, a second draft, or a second founder
+        # notification. The persisted record is the source of truth.
+        inquiry = exc.inquiry
+        store.append_event(
+            "DUPLICATE_DELIVERY",
+            inquiry["inquiry_id"],
+            telegram_message_id=str(telegram_message_id),
+        )
+        logger.info(
+            "[DUPLICATE] redelivered message for %s", inquiry["inquiry_id"]
+        )
+        return inquiry
     inquiry_id = inquiry["inquiry_id"]
     store.append_event("INQUIRY_RECEIVED", inquiry_id)
     logger.info("[RECEIVED] %s", inquiry_id)
@@ -128,6 +151,10 @@ async def _process_inquiry_record(
             property_context,
             mock_mode=settings.mock_mode,
             api_key=settings.gemini_api_key or None,
+            model=settings.gemini_model,
+            temperature=settings.gemini_temperature,
+            max_output_tokens=settings.gemini_max_output_tokens,
+            timeout_seconds=settings.gemini_timeout_seconds,
         )
     except Exception as exc:
         failed = store.update_inquiry(
@@ -288,7 +315,22 @@ async def buyer_text(
         await message.reply_text("Please send your question as a text message.")
         return
 
-    # Persist before acknowledging so a process restart cannot lose a received inquiry.
+    # Process-local anti-flood protection. Rate-limited messages are
+    # answered safely and are not persisted as inquiries, so flooding
+    # cannot trigger founder-notification storms.
+    rate_limiter: RateLimiter | None = context.application.bot_data.get(
+        "rate_limiter"
+    )
+    sender_key = str(chat.id)
+    if rate_limiter is not None and not rate_limiter.allow(sender_key):
+        store.append_event("RATE_LIMITED", sender=sender_key)
+        logger.warning("[RATE_LIMITED] sender %s", sender_key)
+        await message.reply_text(RATE_LIMITED_ACK)
+        return
+
+    # Persist before acknowledging so a process restart cannot lose a
+    # received inquiry. Redelivered Telegram messages are deduplicated
+    # against the durable record.
     try:
         received_at = (
             message.date.astimezone(BUSINESS_TZ).isoformat()
@@ -300,16 +342,33 @@ async def buyer_text(
             telegram_message_id=message.message_id,
             message=text,
             received_at=received_at,
+            telegram_chat_id=chat.id,
         )
-        store.append_event("INQUIRY_RECEIVED", inquiry["inquiry_id"])
-        logger.info("[RECEIVED] %s", inquiry["inquiry_id"])
+    except DuplicateInquiryError as exc:
+        # Telegram redelivered a message that is already durable. This
+        # happens when the process died between persisting and
+        # acknowledging, so acknowledge again rather than leaving the
+        # buyer silent. No second record, draft, or notification is
+        # created.
+        store.append_event(
+            "DUPLICATE_DELIVERY",
+            exc.inquiry["inquiry_id"],
+            telegram_message_id=str(message.message_id),
+        )
+        logger.info(
+            "[DUPLICATE] redelivered message for %s", exc.inquiry["inquiry_id"]
+        )
         await message.reply_text(BUYER_ACK)
+        return
     except Exception as exc:
         logger.error("[ERROR] unable to persist buyer inquiry (%s)", exc.__class__.__name__)
         await message.reply_text(
             "We could not record your message right now. Please try again shortly."
         )
         return
+    store.append_event("INQUIRY_RECEIVED", inquiry["inquiry_id"])
+    logger.info("[RECEIVED] %s", inquiry["inquiry_id"])
+    await message.reply_text(BUYER_ACK)
 
     # Continue with the already-created inquiry instead of creating a second record.
     await _finish_inquiry(context.application, settings, store, inquiry)
@@ -500,7 +559,13 @@ def build_application(settings: Settings) -> Application:
     )
     store = JSONLStore(settings.data_dir)
     queue = ReviewQueue(store, settings.founder_chat_id)
-    application.bot_data.update(settings=settings, store=store, queue=queue)
+    rate_limiter = RateLimiter(
+        max_per_hour=settings.rate_limit_per_hour,
+        max_per_day=settings.rate_limit_per_day,
+    )
+    application.bot_data.update(
+        settings=settings, store=store, queue=queue, rate_limiter=rate_limiter
+    )
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("send", founder_command_send))
     application.add_handler(

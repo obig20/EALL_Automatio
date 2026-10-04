@@ -31,6 +31,39 @@ class StorageError(RuntimeError):
     """Raised when persisted state cannot be read or safely updated."""
 
 
+class DuplicateInquiryError(StorageError):
+    """A Telegram message that is already persisted was delivered again.
+
+    The carried inquiry is the durable record that already exists, so the
+    caller can safely treat the redelivery as already processed.
+    """
+
+    def __init__(self, inquiry: dict[str, Any]):
+        self.inquiry = inquiry
+        super().__init__(
+            f"Inquiry already exists for Telegram message: "
+            f"{inquiry.get('inquiry_id')}"
+        )
+
+
+def _dedup_key(
+    telegram_chat_id: str | int | None,
+    telegram_user_id: str | int | None,
+    telegram_message_id: str | int | None,
+) -> tuple[str, str] | None:
+    """Stable inbound-message identity, or None when the record is anonymous.
+
+    Telegram message IDs are unique per chat, so the chat (falling back to the
+    user for legacy records) plus the message ID identifies one inbound message.
+    """
+    if telegram_message_id is None:
+        return None
+    sender = telegram_chat_id if telegram_chat_id is not None else telegram_user_id
+    if sender is None:
+        return None
+    return (str(sender), str(telegram_message_id))
+
+
 class JSONLStore:
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
@@ -110,9 +143,26 @@ class JSONLStore:
         message: str,
         received_at: str | None = None,
         inquiry_id: str | None = None,
+        telegram_chat_id: str | int | None = None,
     ) -> dict[str, Any]:
         with _LOCK:
             inquiries = self._read_records(self.inquiries_path)
+            # Inbound deduplication: the same Telegram chat + message ID must
+            # never create a second inquiry, a second draft, or a second
+            # founder notification. The check and the append happen under the
+            # same lock, and the original record was already fsynced, so a
+            # duplicate is only reported once its state is fully durable.
+            key = _dedup_key(
+                telegram_chat_id, telegram_user_id, telegram_message_id
+            )
+            if key is not None:
+                for existing in inquiries:
+                    if _dedup_key(
+                        existing.get("telegram_chat_id"),
+                        existing.get("telegram_user_id"),
+                        existing.get("telegram_message_id"),
+                    ) == key:
+                        raise DuplicateInquiryError(existing)
             if inquiry_id is None:
                 sequence = max(
                     (
@@ -131,6 +181,9 @@ class JSONLStore:
                 "inquiry_id": inquiry_id,
                 "telegram_user_id": (
                     str(telegram_user_id) if telegram_user_id is not None else None
+                ),
+                "telegram_chat_id": (
+                    str(telegram_chat_id) if telegram_chat_id is not None else None
                 ),
                 "telegram_message_id": (
                     str(telegram_message_id) if telegram_message_id is not None else None

@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, median
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 from .config import get_settings
 from .utils import BUSINESS_TZ, format_duration
@@ -21,6 +22,23 @@ HEADER = re.compile(
 )
 
 PERIODS = ("business_hours", "uncovered_hours", "night", "sunday")
+
+# Explicit date orders. "auto" requires unambiguous evidence from the
+# export itself and refuses to guess when every date could be either
+# day-first or month-first.
+DATE_ORDER_FORMATS: dict[str, tuple[str, ...]] = {
+    "day_first": ("%d/%m/%Y", "%d/%m/%y"),
+    "month_first": ("%m/%d/%Y", "%m/%d/%y"),
+    "year_first": ("%Y/%m/%d",),
+}
+
+
+class AmbiguousDateFormatError(ValueError):
+    """The export's date order cannot be determined confidently."""
+
+
+class InvalidTimestampError(ValueError):
+    """A chat header carried a timestamp that cannot be parsed."""
 
 
 @dataclass(frozen=True)
@@ -39,47 +57,116 @@ class ResponseCycle:
     response_seconds: float | None
 
 
-def _parse_timestamp(date_text: str, time_text: str) -> datetime:
-    date_text = date_text.replace(".", "/").replace("-", "/")
+def _date_components(date_text: str) -> tuple[int, int, int] | None:
+    normalized = date_text.replace(".", "/").replace("-", "/")
+    parts = normalized.split("/")
+    if len(parts) != 3:
+        return None
+    try:
+        return int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+
+
+def detect_date_order(text: str) -> str:
+    """Determine the export's date order from unambiguous dates only.
+
+    Returns "day_first", "month_first", or "year_first". Raises
+    AmbiguousDateFormatError when no header date contains evidence
+    (a component greater than 12), so ambiguous exports must be
+    configured explicitly with AUDIT_DATE_ORDER instead of being
+    silently reinterpreted.
+    """
+    for line in text.splitlines():
+        match = HEADER.match(line)
+        if not match:
+            continue
+        components = _date_components(match["date"])
+        if components is None:
+            continue
+        first, second, _ = components
+        if first > 31:
+            return "year_first"
+        if first > 12 >= second:
+            return "day_first"
+        if second > 12 >= first:
+            return "month_first"
+    raise AmbiguousDateFormatError(
+        "Cannot determine the export's date format confidently: "
+        "no date has a day or month greater than 12. Set "
+        "AUDIT_DATE_ORDER explicitly (day_first, month_first, or "
+        "year_first) or pass date_order to analyze_export."
+    )
+
+
+def _parse_timestamp(
+    date_text: str, time_text: str, date_order: str
+) -> datetime:
     time_text = re.sub(r"\s+", " ", time_text.strip()).upper()
     time_formats = ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M:%S %p")
+    components = _date_components(date_text)
+    if components is None:
+        raise InvalidTimestampError(f"Unsupported WhatsApp date: {date_text}")
+    # A leading four-digit year is unambiguous evidence of ISO order
+    # regardless of the configured day/month order.
     date_formats = (
-        "%Y/%m/%d",
-        "%d/%m/%Y",
-        "%m/%d/%Y",
-        "%d/%m/%y",
-        "%m/%d/%y",
+        DATE_ORDER_FORMATS["year_first"]
+        if components[0] > 31
+        else DATE_ORDER_FORMATS.get(date_order, DATE_ORDER_FORMATS["day_first"])
     )
     for date_format in date_formats:
         for time_format in time_formats:
             try:
                 return datetime.strptime(
-                    f"{date_text} {time_text}", f"{date_format} {time_format}"
-                ).replace(tzinfo=BUSINESS_TZ)
+                    f"{date_text.replace('.', '/').replace('-', '/')} {time_text}",
+                    f"{date_format} {time_format}",
+                )
             except ValueError:
                 continue
-    raise ValueError(f"Unsupported WhatsApp timestamp: {date_text}, {time_text}")
+    raise InvalidTimestampError(
+        f"Unsupported WhatsApp timestamp: {date_text}, {time_text} "
+        f"(expected date order: {date_order})"
+    )
 
 
-def parse_export(text: str) -> list[ChatMessage]:
-    """Parse common WhatsApp text exports, retaining multiline message bodies."""
+def _resolve_timezone(timezone: str | ZoneInfo | None) -> ZoneInfo:
+    if timezone is None:
+        return BUSINESS_TZ
+    if isinstance(timezone, ZoneInfo):
+        return timezone
+    return ZoneInfo(timezone)
+
+
+def parse_export(
+    text: str,
+    *,
+    date_order: str = "day_first",
+    timezone: str | ZoneInfo | None = None,
+) -> list[ChatMessage]:
+    """Parse common WhatsApp text exports, retaining multiline bodies.
+
+    ``date_order`` selects how ambiguous DD/MM dates are read. The
+    application default is day-first (the operating context), "auto"
+    requires unambiguous evidence, and any other value fails clearly.
+    """
+    if date_order == "auto":
+        date_order = detect_date_order(text)
+    audit_tz = _resolve_timezone(timezone)
     parsed: list[ChatMessage] = []
     for line in text.splitlines():
         match = HEADER.match(line)
         if match:
             try:
-                timestamp = _parse_timestamp(match["date"], match["time"])
-            except ValueError:
-                # Treat an unsupported header-looking line as body text when possible.
-                if parsed:
-                    previous = parsed[-1]
-                    parsed[-1] = ChatMessage(
-                        previous.timestamp, previous.sender, previous.message + "\n" + line
-                    )
-                continue
+                timestamp = _parse_timestamp(match["date"], match["time"], date_order)
+            except InvalidTimestampError as exc:
+                # A header-shaped line with an unparseable timestamp is a
+                # data problem that must surface, not be hidden as body text.
+                raise InvalidTimestampError(
+                    f"{exc}; line: {line[:120]}"
+                ) from exc
             parsed.append(
                 ChatMessage(
-                    timestamp=timestamp,
+                    timestamp=timestamp.replace(tzinfo=audit_tz),
                     sender=match["sender"].strip(),
                     message=match["message"],
                 )
@@ -152,8 +239,14 @@ def build_response_cycles(
     return cycles
 
 
-def _period(timestamp: datetime, start: int, end: int, uncovered_end: int) -> str:
-    local = timestamp.astimezone(BUSINESS_TZ)
+def _period(
+    timestamp: datetime,
+    start: int,
+    end: int,
+    uncovered_end: int,
+    timezone: ZoneInfo,
+) -> str:
+    local = timestamp.astimezone(timezone)
     if local.weekday() == 6:
         return "sunday"
     if start <= local.hour < end:
@@ -189,8 +282,13 @@ def analyze_export(
     business_start_hour: int = 8,
     business_end_hour: int = 18,
     uncovered_end_hour: int = 21,
+    date_order: str = "day_first",
+    timezone: str | ZoneInfo | None = None,
 ) -> dict:
-    messages = parse_export(text)
+    if date_order == "auto":
+        date_order = detect_date_order(text)
+    audit_tz = _resolve_timezone(timezone)
+    messages = parse_export(text, date_order=date_order, timezone=audit_tz)
     cycles = build_response_cycles(messages, agent_names)
     overall = _metrics(cycles)
     coverage: dict[str, dict] = {}
@@ -203,6 +301,7 @@ def analyze_export(
                 business_start_hour,
                 business_end_hour,
                 uncovered_end_hour,
+                audit_tz,
             )
             == period
         ]
@@ -231,6 +330,7 @@ def analyze_export(
                     business_start_hour,
                     business_end_hour,
                     uncovered_end_hour,
+                    audit_tz,
                 ),
             }
             for cycle in cycles
@@ -239,7 +339,7 @@ def analyze_export(
 
 
 def render_report(report: dict) -> str:
-    def duration(key: str) -> str:
+    def duration(key: str) -> str | None:
         formatted = format_duration(report.get(key))
         return formatted if formatted is not None else "N/A"
 
@@ -299,6 +399,8 @@ def run_audit(input_path: Path, output_path: Path | None = None) -> dict:
         business_start_hour=settings.business_start_hour,
         business_end_hour=settings.business_end_hour,
         uncovered_end_hour=settings.uncovered_end_hour,
+        date_order=settings.audit_date_order,
+        timezone=settings.audit_timezone,
     )
     if output_path is None:
         output_path = Path(__file__).resolve().parent / "reports" / "audit.json"

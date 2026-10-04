@@ -23,11 +23,13 @@ ASTER captures real-estate questions through Telegram, drafts grounded replies f
 
 ## Where things live
 
-- `real_estate_mvp/bot.py` — Telegram ingestion, acknowledgement, and review callbacks
-- `real_estate_mvp/queue.py` — founder authorization, approval, rejection, and manual send
+- `real_estate_mvp/bot.py` — Telegram ingestion, acknowledgement, deduplication, rate limiting, and review callbacks
+- `real_estate_mvp/queue.py` — founder authorization, approval, rejection, and manual send (per-inquiry locks)
 - `real_estate_mvp/knowledge.py` and `data/properties.json` — deterministic demo property data
-- `real_estate_mvp/storage.py` — local inquiry JSONL and append-only event log
+- `real_estate_mvp/storage.py` — local inquiry JSONL, append-only event log, and Telegram inbound deduplication
+- `real_estate_mvp/draft.py` — grounded drafting plus deterministic draft validation
 - `real_estate_mvp/audit.py` — offline WhatsApp-export audit only
+- `real_estate_mvp/ratelimit.py` — process-local anti-flood protection
 - `real_estate_mvp/tests/` — unit and stress tests
 
 ## Architecture decisions
@@ -38,6 +40,10 @@ ASTER captures real-estate questions through Telegram, drafts grounded replies f
 - WhatsApp support is offline text-file parsing; there is no WhatsApp or Meta API.
 - An ambiguous `sending` state is never resent automatically after restart.
 - The founder must confirm `/resolve_send <id> delivered|not_delivered` after inspecting Telegram before retrying an ambiguous send.
+- Mock runtime data lives in `real_estate_mvp/data/mock/`; live data in `real_estate_mvp/data/live/`; runtime state is never committed to Git.
+- Redelivered Telegram messages are deduplicated on (chat ID, message ID) and never create duplicate inquiries.
+- Generated drafts pass a deterministic grounding validator (numbers, bedroom counts, claim vocabulary, marketing/advice phrases) before founder review.
+- The pnpm/TypeScript workspace (`lib/`, `artifacts/`) is unused template scaffold; the Python application is the MVP.
 
 ## Product
 
