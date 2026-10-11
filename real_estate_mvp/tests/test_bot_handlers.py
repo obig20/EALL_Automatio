@@ -1,6 +1,7 @@
 """Bot handler regression tests: rate limiting, dedup, founder authorization."""
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 from real_estate_mvp.bot import buyer_text
@@ -272,3 +273,91 @@ def test_founder_reply_succeeds_on_first_attempt():
 
     ok = asyncio.run(_safe_reply(message, "Manual send: sent."))
     assert ok is True
+
+
+def test_founder_can_cancel_an_inquiry_without_sending(tmp_path):
+    """A founder who starts an edit and changes their mind must be able
+    to abort cleanly. /cancel must never send a buyer message."""
+    from types import SimpleNamespace
+
+    from real_estate_mvp.bot import founder_command_cancel
+    from real_estate_mvp.config import Settings
+    from real_estate_mvp.queue import ReviewQueue
+    from real_estate_mvp.storage import JSONLStore
+
+    store = JSONLStore(tmp_path)
+    queue = ReviewQueue(store, founder_chat_id="777")
+    settings = Settings(
+        telegram_bot_token="", founder_chat_id="777", gemini_api_key="",
+        mock_mode=True, business_start_hour=8, business_end_hour=18,
+        uncovered_end_hour=21, agent_names=("Agent", "Sales", "Admin"),
+        data_dir=tmp_path,
+        properties_file=Path(__file__).parents[1] / "data" / "properties.json",
+    )
+
+    inquiry = store.create_inquiry(
+        telegram_user_id=123, telegram_message_id=1, message="How much is the Bole apartment?",
+    )
+    store.update_inquiry(
+        inquiry["inquiry_id"], status="awaiting_review", draft="It is listed at 12,000,000 ETB."
+    )
+
+    sent = []
+
+    async def send_message(chat_id, text):
+        sent.append(text)
+
+    async def run():
+        update = SimpleNamespace(
+            effective_message=SimpleNamespace(text="/cancel inq_000001"),
+            effective_user=SimpleNamespace(id=777),
+            effective_chat=SimpleNamespace(id=777),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(
+                bot=SimpleNamespace(send_message=send_message),
+                bot_data={"settings": settings, "store": store, "queue": queue},
+            )
+        )
+        await founder_command_cancel(update, context)
+
+    asyncio.run(run())
+    assert store.get_inquiry("inq_000001")["status"] == "rejected"
+    assert sent == []
+    events = [event["event"] for event in store.list_events()]
+    assert "REJECTED" in events
+
+
+def test_cancel_requires_founder_authorization(tmp_path):
+    """An unauthorized user cannot cancel an inquiry."""
+    from types import SimpleNamespace
+
+    from real_estate_mvp.bot import founder_command_cancel
+    from real_estate_mvp.queue import ReviewQueue
+    from real_estate_mvp.storage import JSONLStore
+
+    store = JSONLStore(tmp_path)
+    ReviewQueue(store, founder_chat_id="777")
+    store.create_inquiry(
+        telegram_user_id=123, telegram_message_id=1, message="How much is the Bole apartment?",
+    )
+
+    async def run():
+        update = SimpleNamespace(
+            effective_message=SimpleNamespace(text="/cancel inq_000001"),
+            effective_user=SimpleNamespace(id=888),
+            effective_chat=SimpleNamespace(id=888),
+        )
+        context = SimpleNamespace(
+            application=SimpleNamespace(
+                bot=SimpleNamespace(send_message=lambda *a, **k: None),
+                bot_data={
+                    "store": store,
+                    "queue": ReviewQueue(store, "777"),
+                },
+            )
+        )
+        await founder_command_cancel(update, context)
+
+    asyncio.run(run())
+    assert store.get_inquiry("inq_000001")["status"] == "received"

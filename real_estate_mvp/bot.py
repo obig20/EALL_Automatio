@@ -421,6 +421,47 @@ async def _finish_inquiry(
     return prepared
 
 
+async def founder_command_cancel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Abort an in-progress manual edit without sending anything.
+
+    The founder may start typing an edited reply and change their mind;
+    this gives them a clean way to abort rather than sending a wrong
+    message or leaving the inquiry in an ambiguous state.
+    """
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat:
+        return
+    queue: ReviewQueue = context.application.bot_data["queue"]
+    store: JSONLStore = context.application.bot_data["store"]
+    if not queue.is_founder(user.id, chat.id):
+        store.append_event("UNAUTHORIZED_ACTION", action="cancel_command")
+        await _safe_reply(message, "This command is not available.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await _safe_reply(message, "Usage: /cancel <inquiry_id>")
+        return
+    inquiry_id = parts[1]
+    inquiry = store.get_inquiry(inquiry_id)
+    if not inquiry:
+        await _safe_reply(message, f"Inquiry {inquiry_id} not found.")
+        return
+    if inquiry.get("status") not in {"awaiting_review", "escalated", "draft_failed"}:
+        await _safe_reply(
+            message,
+            f"Inquiry {inquiry_id} is {inquiry['status'].replace('_', ' ')}; nothing to cancel.",
+        )
+        return
+    result = await queue.reject(inquiry_id, actor_user_id=user.id, chat_id=chat.id)
+    await _safe_reply(
+        message, f"Inquiry {inquiry_id} cancelled ({result['status']}). No message was sent."
+    )
+
+
 async def founder_command_send(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -438,7 +479,12 @@ async def founder_command_send(
 
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
-        await _safe_reply(message, "Usage: /send <inquiry_id> <message>")
+        await _safe_reply(
+            message,
+            "Usage: /send <inquiry_id> <message>\n"
+            "Example: /send inq_000001 It is listed at 12,000,000 ETB.\n"
+            "Abort an edit with /cancel <inquiry_id>.",
+        )
         return
     inquiry_id, reply_text = parts[1], parts[2]
     result = await queue.manual_send(
@@ -565,7 +611,9 @@ async def review_callback(
         await _safe_query_answer(query, "Manual review required.")
         await _safe_send_message(
             context.bot, chat.id,
-            f"Review the facts, then send:\n/send {inquiry_id} <your approved reply>",
+            "Review the facts, then send your approved reply:\n"
+            f"/send {inquiry_id} <your approved reply>\n"
+            f"Abort without sending: /cancel {inquiry_id}",
         )
         return
     if action == "resolve":
@@ -669,6 +717,7 @@ def build_application(settings: Settings) -> Application:
     )
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("send", founder_command_send))
+    application.add_handler(CommandHandler("cancel", founder_command_cancel))
     application.add_handler(
         CommandHandler("resolve_send", founder_command_resolve_send)
     )
