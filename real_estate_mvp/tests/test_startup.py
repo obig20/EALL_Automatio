@@ -51,3 +51,36 @@ def test_live_startup_loads_runtime_state_into_bot_data(tmp_path):
     assert application.bot_data["store"].data_dir == tmp_path
     assert application.bot_data["queue"] is not None
     assert application.bot_data["rate_limiter"] is not None
+
+
+def test_error_handler_suppresses_transient_network_noise(caplog):
+    """python-telegram-bot prints a full traceback on every transient
+    network blip even though it recovers on its own. The registered
+    handler must log those compactly instead of crashing."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from real_estate_mvp.bot import _error_handler
+    from telegram.error import NetworkError
+
+    context = SimpleNamespace(error=NetworkError("httpx.ConnectError: connection refused"))
+
+    asyncio.run(_error_handler(None, context))
+    messages = [r.message for r in caplog.records]
+    assert any("transient" in m for m in messages)
+    assert not any("No error handlers" in m for m in messages)
+
+
+def test_error_handler_surfaces_unexpected_errors(caplog):
+    """Unexpected errors must still be logged loudly so they are not
+    silently swallowed by the error handler."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from real_estate_mvp.bot import _error_handler
+
+    context = SimpleNamespace(error=ValueError("unexpected"))
+
+    asyncio.run(_error_handler(None, context))
+    messages = [r.message for r in caplog.records]
+    assert any("unhandled" in m for m in messages)

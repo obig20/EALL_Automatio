@@ -9,7 +9,7 @@ import re
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -632,6 +632,21 @@ async def unknown_command(
         )
 
 
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Suppress noisy library tracebacks for transient network errors.
+
+    python-telegram-bot prints "No error handlers are registered" with a
+    full traceback on every transient network blip, even though the
+    library recovers on its own. Log those compactly instead; surface
+    unexpected errors loudly so they are not silently swallowed.
+    """
+    error = getattr(context.error, "__class__", type(context.error))
+    if isinstance(context.error, (NetworkError, TimedOut, asyncio.TimeoutError)):
+        logger.warning("[NETWORK] transient Telegram error (%s); library recovers", error.__name__)
+        return
+    logger.error("[ERROR] unhandled update error (%s)", error.__name__, exc_info=context.error)
+
+
 def build_application(settings: Settings) -> Application:
     settings.validate()
     if settings.mock_mode:
@@ -642,6 +657,7 @@ def build_application(settings: Settings) -> Application:
         .post_init(recover_pending_inquiries)
         .build()
     )
+    application.add_error_handler(_error_handler)
     store = JSONLStore(settings.data_dir)
     queue = ReviewQueue(store, settings.founder_chat_id)
     rate_limiter = RateLimiter(
