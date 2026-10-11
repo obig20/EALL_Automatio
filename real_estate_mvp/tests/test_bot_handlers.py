@@ -237,3 +237,38 @@ def test_unauthorized_actions_are_logged_without_sensitive_data(tmp_path):
     # The log entry must not contain the buyer message or draft text.
     assert "message" not in events[0]
     assert "draft" not in events[0]
+
+
+def test_founder_reply_survives_transient_telegram_timeout(tmp_path):
+    """A transient Telegram timeout on the founder's confirmation
+    reply must not crash the handler. The durable state transition
+    has already happened, so the handler completes and logs safely."""
+    from real_estate_mvp.bot import _safe_reply
+
+    attempts = {"count": 0}
+
+    async def failing_reply(text, **kwargs):
+        attempts["count"] += 1
+        raise TimeoutError("synthetic transient Telegram timeout")
+
+    message = SimpleNamespace()
+    # Telegram's reply_text is a bound async method, so assign it as
+    # an attribute callable that returns a coroutine.
+    message.reply_text = failing_reply
+
+    ok = asyncio.run(_safe_reply(message, "Manual send: sent."))
+    assert ok is False
+    assert attempts["count"] == 3
+
+
+def test_founder_reply_succeeds_on_first_attempt():
+    from real_estate_mvp.bot import _safe_reply
+
+    async def ok_reply(text, **kwargs):
+        return None
+
+    message = SimpleNamespace()
+    message.reply_text = ok_reply
+
+    ok = asyncio.run(_safe_reply(message, "Manual send: sent."))
+    assert ok is True

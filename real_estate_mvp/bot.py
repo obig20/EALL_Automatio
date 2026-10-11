@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 from typing import Any
@@ -24,7 +25,7 @@ from .draft import DraftGenerationError, generate_draft
 from .knowledge import find_relevant_properties, get_property_context
 from .queue import ReviewQueue, format_review_message
 from .ratelimit import RateLimiter
-from .retry import with_transient_retry_async
+from .retry import is_transient_error, with_transient_retry_async
 from .storage import DuplicateInquiryError, JSONLStore
 from .utils import BUSINESS_TZ, clip_text
 
@@ -36,6 +37,39 @@ RATE_LIMITED_ACK = (
     "our office directly."
 )
 MAX_DRAFT_INPUT_CHARS = 4000
+
+
+async def _safe_reply(message, text: str) -> bool:
+    """Reply to the founder, retrying transient Telegram errors.
+
+    Founder-facing replies must never crash a handler. The durable
+    state transition has already happened by the time this runs, so a
+    failed reply is logged and reported to the founder as a safe
+    fallback rather than an unhandled exception.
+    """
+    async def attempt():
+        result = message.reply_text(text)
+        # Telegram's reply_text is async, but tolerate a plain callable
+        # so the helper is robust in tests.
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    try:
+        await with_transient_retry_async(
+            attempt,
+            attempts=3,
+            wait_min_seconds=1,
+            wait_max_seconds=3,
+        )
+        return True
+    except Exception as exc:
+        logger.error(
+            "[ERROR] founder reply failed (%s): %s",
+            exc.__class__.__name__,
+            text[:120],
+        )
+        return False
 
 
 def _prepare_review_keyboard(
@@ -292,8 +326,9 @@ async def start_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     if update.effective_message:
-        await update.effective_message.reply_text(
-            "Welcome. Send a text inquiry about a property and the team will review it."
+        await _safe_reply(
+            update.effective_message,
+            "Welcome. Send a text inquiry about a property and the team will review it.",
         )
 
 
@@ -308,11 +343,11 @@ async def buyer_text(
     settings: Settings = context.application.bot_data["settings"]
     store: JSONLStore = context.application.bot_data["store"]
     if str(chat.id) == settings.founder_chat_id:
-        await message.reply_text("For a manual buyer response, use /send <inquiry_id> <message>.")
+        await _safe_reply(message, "For a manual buyer response, use /send <inquiry_id> <message>.")
         return
     text = message.text or ""
     if not text.strip():
-        await message.reply_text("Please send your question as a text message.")
+        await _safe_reply(message, "Please send your question as a text message.")
         return
 
     # Process-local anti-flood protection. Rate-limited messages are
@@ -325,7 +360,7 @@ async def buyer_text(
     if rate_limiter is not None and not rate_limiter.allow(sender_key):
         store.append_event("RATE_LIMITED", sender=sender_key)
         logger.warning("[RATE_LIMITED] sender %s", sender_key)
-        await message.reply_text(RATE_LIMITED_ACK)
+        await _safe_reply(message, RATE_LIMITED_ACK)
         return
 
     # Persist before acknowledging so a process restart cannot lose a
@@ -358,17 +393,18 @@ async def buyer_text(
         logger.info(
             "[DUPLICATE] redelivered message for %s", exc.inquiry["inquiry_id"]
         )
-        await message.reply_text(BUYER_ACK)
+        await _safe_reply(message, BUYER_ACK)
         return
     except Exception as exc:
         logger.error("[ERROR] unable to persist buyer inquiry (%s)", exc.__class__.__name__)
-        await message.reply_text(
-            "We could not record your message right now. Please try again shortly."
+        await _safe_reply(
+            message,
+            "We could not record your message right now. Please try again shortly.",
         )
         return
     store.append_event("INQUIRY_RECEIVED", inquiry["inquiry_id"])
     logger.info("[RECEIVED] %s", inquiry["inquiry_id"])
-    await message.reply_text(BUYER_ACK)
+    await _safe_reply(message, BUYER_ACK)
 
     # Continue with the already-created inquiry instead of creating a second record.
     await _finish_inquiry(context.application, settings, store, inquiry)
@@ -397,12 +433,12 @@ async def founder_command_send(
     store: JSONLStore = context.application.bot_data["store"]
     if not queue.is_founder(user.id, chat.id):
         store.append_event("UNAUTHORIZED_ACTION", action="manual_send_command")
-        await message.reply_text("This command is not available.")
+        await _safe_reply(message, "This command is not available.")
         return
 
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 3:
-        await message.reply_text("Usage: /send <inquiry_id> <message>")
+        await _safe_reply(message, "Usage: /send <inquiry_id> <message>")
         return
     inquiry_id, reply_text = parts[1], parts[2]
     result = await queue.manual_send(
@@ -414,7 +450,7 @@ async def founder_command_send(
             chat_id=buyer_chat_id, text=text
         ),
     )
-    await message.reply_text(f"Manual send: {result['status'].replace('_', ' ')}.")
+    await _safe_reply(message, f"Manual send: {result['status'].replace('_', ' ')}.")
     updated_inquiry = result.get("inquiry")
     if updated_inquiry:
         await _notify_founder(
@@ -435,13 +471,14 @@ async def founder_command_resolve_send(
     store: JSONLStore = context.application.bot_data["store"]
     if not queue.is_founder(user.id, chat.id):
         store.append_event("UNAUTHORIZED_ACTION", action="resolve_send_command")
-        await message.reply_text("This command is not available.")
+        await _safe_reply(message, "This command is not available.")
         return
     parts = (message.text or "").split()
     if len(parts) != 3:
-        await message.reply_text(
+        await _safe_reply(
+            message,
             "Usage: /resolve_send <inquiry_id> delivered|not_delivered\n"
-            "Check the buyer chat before choosing."
+            "Check the buyer chat before choosing.",
         )
         return
     result = await queue.resolve_ambiguous_send(
@@ -450,8 +487,8 @@ async def founder_command_resolve_send(
         actor_user_id=user.id,
         chat_id=chat.id,
     )
-    await message.reply_text(
-        f"Send resolution: {result['status'].replace('_', ' ')}."
+    await _safe_reply(
+        message, f"Send resolution: {result['status'].replace('_', ' ')}."
     )
     inquiry = result.get("inquiry")
     if inquiry:
@@ -462,6 +499,44 @@ async def founder_command_resolve_send(
             inquiry,
             edit_existing=True,
         )
+
+
+async def _safe_query_answer(query, text: str, *, show_alert: bool = False) -> bool:
+    """Acknowledge a callback query, tolerating transient Telegram errors."""
+    try:
+        await with_transient_retry_async(
+            lambda: query.answer(text, show_alert=show_alert),
+            attempts=2,
+            wait_min_seconds=1,
+            wait_max_seconds=2,
+        )
+        return True
+    except Exception as exc:
+        logger.error(
+            "[ERROR] callback answer failed (%s): %s",
+            exc.__class__.__name__,
+            text[:120],
+        )
+        return False
+
+
+async def _safe_send_message(bot, chat_id: int, text: str) -> bool:
+    """Send a founder-facing message, tolerating transient Telegram errors."""
+    try:
+        await with_transient_retry_async(
+            lambda: bot.send_message(chat_id=chat_id, text=text),
+            attempts=2,
+            wait_min_seconds=1,
+            wait_max_seconds=2,
+        )
+        return True
+    except Exception as exc:
+        logger.error(
+            "[ERROR] founder message failed (%s): %s",
+            exc.__class__.__name__,
+            text[:120],
+        )
+        return False
 
 
 async def review_callback(
@@ -478,26 +553,26 @@ async def review_callback(
         r"review:(approve|edit|reject|resolve):(inq_\d{6,})", query.data or ""
     )
     if not match:
-        await query.answer("This action is no longer available.", show_alert=True)
+        await _safe_query_answer(query, "This action is no longer available.", show_alert=True)
         return
     action, inquiry_id = match.groups()
     if not queue.is_founder(user.id, chat.id):
         store.append_event("UNAUTHORIZED_ACTION", action=f"review_{action}")
-        await query.answer("Unauthorized.", show_alert=True)
+        await _safe_query_answer(query, "Unauthorized.", show_alert=True)
         return
 
     if action == "edit":
-        await query.answer("Manual review required.")
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text=f"Review the facts, then send:\n/send {inquiry_id} <your approved reply>",
+        await _safe_query_answer(query, "Manual review required.")
+        await _safe_send_message(
+            context.bot, chat.id,
+            f"Review the facts, then send:\n/send {inquiry_id} <your approved reply>",
         )
         return
     if action == "resolve":
-        await query.answer("Check the buyer chat before resolving.")
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text=(
+        await _safe_query_answer(query, "Check the buyer chat before resolving.")
+        await _safe_send_message(
+            context.bot, chat.id,
+            (
                 f"Delivery is uncertain for {inquiry_id}. Check the buyer chat, then send:\n"
                 f"/resolve_send {inquiry_id} delivered\n"
                 f"or /resolve_send {inquiry_id} not_delivered\n"
@@ -518,32 +593,42 @@ async def review_callback(
         result = await queue.reject(
             inquiry_id, actor_user_id=user.id, chat_id=chat.id
         )
-    await query.answer(result["status"].replace("_", " ").capitalize())
+    await _safe_query_answer(query, result["status"].replace("_", " ").capitalize())
     inquiry = store.get_inquiry(inquiry_id)
     if inquiry:
         updated_text = format_review_message(inquiry)
         if result["status"] == "sent":
-            await query.edit_message_text(updated_text)
+            await _safe_reply(query.message, updated_text)
         elif result["status"] == "rejected":
-            await query.edit_message_text(updated_text, reply_markup=None)
+            try:
+                await query.edit_message_text(updated_text, reply_markup=None)
+            except Exception as exc:
+                logger.error("[ERROR] edit message failed (%s)", exc.__class__.__name__)
         elif result["status"] == "send_failed":
-            await query.edit_message_text(
-                clip_text(updated_text, 3500),
-                reply_markup=_prepare_review_keyboard(inquiry),
-            )
+            try:
+                await query.edit_message_text(
+                    clip_text(updated_text, 3500),
+                    reply_markup=_prepare_review_keyboard(inquiry),
+                )
+            except Exception as exc:
+                logger.error("[ERROR] edit message failed (%s)", exc.__class__.__name__)
         elif inquiry.get("status") == "sending":
-            await query.edit_message_text(
-                clip_text(updated_text, 3500),
-                reply_markup=_prepare_review_keyboard(inquiry),
-            )
+            try:
+                await query.edit_message_text(
+                    clip_text(updated_text, 3500),
+                    reply_markup=_prepare_review_keyboard(inquiry),
+                )
+            except Exception as exc:
+                logger.error("[ERROR] edit message failed (%s)", exc.__class__.__name__)
 
 
 async def unknown_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     if update.effective_message:
-        await update.effective_message.reply_text(
-            "Unsupported command. Send a text inquiry or use /start."
+        await _safe_reply(
+            update.effective_message,
+            "Unsupported command. Send a text inquiry or use /start.",
         )
 
 

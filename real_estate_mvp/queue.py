@@ -83,11 +83,12 @@ def format_review_message(inquiry: dict[str, Any]) -> str:
                 f"/resolve_send {inquiry['inquiry_id']} delivered|not_delivered",
             ]
         )
-    elif status in {"draft_failed", "send_failed", "approved"}:
+    elif status in {"draft_failed", "send_failed", "approved", "escalated"}:
         lines.extend(
             [
                 "",
-                f"To send a reviewed manual reply: /send {inquiry['inquiry_id']} <message>",
+                "The AI was prevented from guessing. Review the facts, then send a manual reply:",
+                f"/send {inquiry['inquiry_id']} <your approved reply>",
             ]
         )
     return "\n".join(lines)
