@@ -1,0 +1,117 @@
+# ASTER — Prevent Demo Properties from Being Treated as Verified
+
+We are continuing development of the existing ASTER Python-based real-estate inquiry assistant.
+
+## Objective
+
+Ensure demo catalog listings can never be mistaken for verified real properties or used to generate buyer-facing claims that imply the listings are real, current, or verified.
+
+**This is a read-only audit first. Do not edit any files until you have reported your findings, proposed the minimal safe implementation, and received my explicit approval.**
+
+## 1. Protect the existing worktree
+
+Before doing anything, inspect the actual repository location, current branch, and Git worktree status.
+
+- Preserve all existing uncommitted changes.
+- Do not reset, stash, overwrite, or discard user changes.
+- Do not switch branches or create a new branch until you have checked whether doing so could affect existing work.
+- Plan to use a separate feature branch for implementation.
+- Do not commit, push, deploy, or send Telegram messages.
+- Do not modify production data or expose credentials.
+
+## 2. Inspect the actual implementation
+
+Inspect the relevant existing code and tests, particularly:
+
+- `real_estate_mvp/catalog.py`
+- `real_estate_mvp/knowledge.py`
+- `real_estate_mvp/draft.py`
+- `real_estate_mvp/bot.py`
+- `real_estate_mvp/queue.py`
+- The relevant catalog, matching, drafting, validation, and bot tests.
+
+Trace how each property record moves from catalog loading and normalization through matching, context retrieval, draft generation, validation, and founder review.
+
+Inspect the actual provenance and verification fields, including how demo, imported, unverified, and verified records are represented. Do not assume the current implementation matches earlier reports.
+
+## 3. Investigate the precise safety gap
+
+Determine whether a demo property can currently:
+
+- Be matched to a real buyer inquiry.
+- Be included in the drafting context as though it were a real listing.
+- Produce an apparently valid AI draft containing demo prices, amenities, payment terms, or availability.
+- Reach the founder review queue without a clear warning.
+- Be approved and sent to a buyer without a clear distinction between demonstration data and verified listing data.
+
+Check whether verification is enforced in the actual drafting and validation path, rather than only displayed in the founder review message.
+
+Distinguish confirmed vulnerabilities from hypothetical risks. Cite the relevant functions and tests.
+
+## 4. Desired behavior
+
+Use the smallest change that enforces these principles:
+
+**Verified real listing**
+- May be used to draft factual property answers, provided the requested facts are supported, sufficiently current, and pass existing validation.
+
+**Demo listing**
+- Must never be treated as a verified real property.
+- Must not produce a buyer-facing draft that presents demo details as real listing facts.
+- May remain available for development and testing.
+- Must remain clearly identified as demo data in internal review and test output.
+
+**Imported or unverified listing**
+- Must not automatically be treated as verified merely because it has detailed fields or a successful property match.
+- Must follow the existing provenance and verification rules, or be routed for human review where verification is insufficient.
+
+Do not equate a successful match with verification. Do not equate field presence with verification.
+
+If a demo record is matched to a buyer inquiry, ASTER should safely route it for human handling or use the existing escalation mechanism without leaking demo facts as real listing information.
+
+## 5. Preserve existing safeguards
+
+Do not weaken or bypass:
+
+- Numeric grounding.
+- Draft validation.
+- Existing escalation rules.
+- Property-match ambiguity handling.
+- Founder authorization.
+- Mandatory explicit founder approval for AI-generated buyer replies.
+- Founder-written manual replies, including `/send` when AI drafting fails.
+
+Do not introduce an autonomous buyer-message sending path.
+
+Do not rebuild the project, replace the catalog, introduce a new framework, or change unrelated behavior.
+
+## 6. Regression tests to propose
+
+Inspect existing tests and identify the smallest additional tests necessary to prove that:
+
+1. A demo listing cannot generate a buyer-facing factual draft using its demo details.
+2. A demo listing remains identifiable as demo data.
+3. A verified listing can still produce a properly grounded draft.
+4. An imported or unverified listing cannot be treated as verified merely because its fields are populated.
+5. Existing numeric grounding, validation, and escalation behavior remains intact.
+6. Failed AI drafts cannot be approved or automatically sent.
+7. Founder-written manual replies remain available.
+8. Existing matching and normal inquiry processing do not regress.
+
+Adapt these cases to the actual architecture; avoid duplicate tests.
+
+## 7. Report before editing
+
+Provide:
+
+1. Current branch and worktree status.
+2. The exact functions where provenance and verification are assigned, normalized, and enforced.
+3. Confirmed risks and supporting code/test evidence.
+4. The smallest proposed file list and implementation plan.
+5. Regression tests and expected outcomes.
+6. Dependency and test execution requirements.
+7. Any decision that requires my input.
+
+Do not edit files during this audit. Do not claim tests passed unless you actually ran them.
+
+Stop after presenting the diagnosis and proposed plan. Wait for my explicit approval before implementing anything.
