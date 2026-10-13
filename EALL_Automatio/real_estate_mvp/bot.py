@@ -21,7 +21,7 @@ from telegram.ext import (
 )
 
 from .config import Settings
-from .draft import DraftGenerationError, generate_draft
+from .draft import DRAFT_FAILURE_CATEGORIES, DraftGenerationError, generate_draft
 from .knowledge import find_relevant_properties, get_property_context
 from .queue import ReviewQueue, format_review_message
 from .ratelimit import RateLimiter
@@ -37,6 +37,108 @@ RATE_LIMITED_ACK = (
     "our office directly."
 )
 MAX_DRAFT_INPUT_CHARS = 4000
+
+
+def _safe_status_code(exc: BaseException) -> int | None:
+    """Return an integer HTTP status only; never serialize provider error text."""
+    for candidate in (getattr(exc, "status_code", None), getattr(exc, "code", None)):
+        if type(candidate) is int and 100 <= candidate <= 599:
+            return candidate
+    return None
+
+
+def _failure_diagnostic(
+    exc: Exception,
+    *,
+    stage: str,
+    category: str,
+    message_length: int,
+    mock_mode: bool,
+) -> dict[str, Any]:
+    cause = exc.__cause__
+    status_code = _safe_status_code(cause) if cause is not None else None
+    if status_code is None:
+        status_code = _safe_status_code(exc)
+    return {
+        "error": exc.__class__.__name__,
+        "error_category": category,
+        "stage": stage,
+        "cause_class": cause.__class__.__name__ if cause is not None else None,
+        "upstream_status": status_code,
+        "message_length": message_length,
+        "mock_mode": mock_mode,
+    }
+
+
+def _failure_category(exc: Exception, stage: str) -> str:
+    if (
+        isinstance(exc, DraftGenerationError)
+        and exc.category in DRAFT_FAILURE_CATEGORIES
+    ):
+        return exc.category
+    if stage == "property_context":
+        return "PROPERTY_CONTEXT_FAILED"
+    if stage.endswith("_persistence"):
+        return "PERSISTENCE_FAILED"
+    if stage == "draft_generation":
+        return "DRAFT_GENERATION_FAILED"
+    return "UNEXPECTED_PIPELINE_ERROR"
+
+
+def _record_draft_failure(
+    store: JSONLStore,
+    settings: Settings,
+    inquiry: dict[str, Any],
+    exc: Exception,
+    *,
+    stage: str,
+    category: str,
+) -> dict[str, Any]:
+    """Persist a failed, non-approvable inquiry with allowlisted diagnostics."""
+    inquiry_id = inquiry["inquiry_id"]
+    message_length = len(inquiry.get("message") or "")
+    diagnostic = _failure_diagnostic(
+        exc,
+        stage=stage,
+        category=category,
+        message_length=message_length,
+        mock_mode=settings.mock_mode,
+    )
+    failed = store.update_inquiry(
+        inquiry_id,
+        status="draft_failed",
+        draft=None,
+        draft_error=diagnostic["error"],
+        draft_error_category=diagnostic["error_category"],
+        draft_error_stage=diagnostic["stage"],
+        draft_error_cause_class=diagnostic["cause_class"],
+        draft_error_upstream_status=diagnostic["upstream_status"],
+        draft_error_message_length=diagnostic["message_length"],
+        draft_error_mock_mode=diagnostic["mock_mode"],
+        requires_escalation=False,
+    )
+    try:
+        store.append_event("DRAFT_FAILED", inquiry_id, **diagnostic)
+    except Exception as event_exc:
+        # The state transition is already durable. Keep logs useful without
+        # including either exception's potentially sensitive message.
+        logger.error(
+            "[DRAFT_FAILURE_DIAGNOSTIC_WRITE_FAILED] inquiry=%s category=PERSISTENCE_FAILED "
+            "stage=failure_event_persistence error=%s cause=%s",
+            inquiry_id,
+            event_exc.__class__.__name__,
+            exc.__class__.__name__,
+        )
+    logger.error(
+        "[DRAFT_FAILED] inquiry=%s category=%s stage=%s error=%s cause=%s status=%s",
+        inquiry_id,
+        diagnostic["error_category"],
+        diagnostic["stage"],
+        diagnostic["error"],
+        diagnostic["cause_class"],
+        diagnostic["upstream_status"],
+    )
+    return failed
 
 
 async def _safe_reply(message, text: str) -> bool:
@@ -157,13 +259,16 @@ async def _process_inquiry_record(
     """Run matching and drafting for an inquiry that is already durable."""
     inquiry_id = inquiry["inquiry_id"]
     message = inquiry["message"]
+    stage = "property_matching"
     try:
         matched_ids = find_relevant_properties(message)
+        stage = "property_context"
         property_context = [
             property_data
             for property_id in matched_ids
             if (property_data := get_property_context(property_id)) is not None
         ]
+        stage = "match_persistence"
         store.update_inquiry(
             inquiry_id,
             status="matched",
@@ -175,10 +280,16 @@ async def _process_inquiry_record(
         )
         logger.info("[MATCHED] %s count=%d", inquiry_id, len(matched_ids))
 
+        stage = "draft_start_persistence"
         store.update_inquiry(inquiry_id, status="drafting")
         store.append_event("DRAFT_STARTED", inquiry_id)
+        stage = "draft_input_validation"
         if len(message) > MAX_DRAFT_INPUT_CHARS:
-            raise DraftGenerationError("Buyer message exceeds the safe draft limit")
+            raise DraftGenerationError(
+                "Buyer message exceeds the safe draft limit",
+                category="INPUT_TOO_LONG",
+            )
+        stage = "draft_generation"
         result = await asyncio.to_thread(
             generate_draft,
             message,
@@ -191,43 +302,46 @@ async def _process_inquiry_record(
             timeout_seconds=settings.gemini_timeout_seconds,
         )
     except Exception as exc:
-        failed = store.update_inquiry(
-            inquiry_id,
-            status="draft_failed",
-            draft=None,
-            draft_error=exc.__class__.__name__,
-            requires_escalation=False,
+        return _record_draft_failure(
+            store,
+            settings,
+            inquiry,
+            exc,
+            stage=stage,
+            category=_failure_category(exc, stage),
         )
-        store.append_event(
-            "DRAFT_FAILED", inquiry_id, error=exc.__class__.__name__
-        )
-        logger.error(
-            "[ERROR] unexpected draft failure for %s (%s)",
-            inquiry_id,
-            exc.__class__.__name__,
-        )
-        return failed
 
     status = "escalated" if result.requires_escalation else "awaiting_review"
-    prepared = store.update_inquiry(
-        inquiry_id,
-        status=status,
-        draft=result.text,
-        requires_escalation=result.requires_escalation,
-        escalation_reason=result.reason,
-        draft_model=result.model,
-    )
-    if result.requires_escalation:
-        store.append_event(
-            "ESCALATION",
+    stage = "draft_result_persistence"
+    try:
+        prepared = store.update_inquiry(
             inquiry_id,
-            reason=result.reason or "Unknown Property Parameter",
+            status=status,
+            draft=result.text,
+            requires_escalation=result.requires_escalation,
+            escalation_reason=result.reason,
+            draft_model=result.model,
         )
-        logger.info("[ESCALATION] %s", inquiry_id)
-    else:
-        store.append_event("DRAFT_CREATED", inquiry_id, model=result.model)
-        store.append_event("AWAITING_REVIEW", inquiry_id)
-        logger.info("[REVIEW] %s", inquiry_id)
+        if result.requires_escalation:
+            store.append_event(
+                "ESCALATION",
+                inquiry_id,
+                reason=result.reason or "Unknown Property Parameter",
+            )
+            logger.info("[ESCALATION] %s", inquiry_id)
+        else:
+            store.append_event("DRAFT_CREATED", inquiry_id, model=result.model)
+            store.append_event("AWAITING_REVIEW", inquiry_id)
+            logger.info("[REVIEW] %s", inquiry_id)
+    except Exception as exc:
+        return _record_draft_failure(
+            store,
+            settings,
+            inquiry,
+            exc,
+            stage=stage,
+            category="PERSISTENCE_FAILED",
+        )
     return prepared
 
 

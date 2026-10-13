@@ -90,13 +90,42 @@ def test_live_api_failure_and_empty_response_are_explicit(monkeypatch):
             self.models = Models()
 
     monkeypatch.setattr(genai, "Client", Client)
-    with pytest.raises(DraftGenerationError, match="empty response"):
+    with pytest.raises(DraftGenerationError, match="empty response") as raised:
         generate_draft(
             "What is the price of the Bole 2 bedroom apartment?",
             get_property("bole_apartment_2bed"),
             mock_mode=False,
             api_key="test-not-a-real-key",
         )
+    assert raised.value.category == "MODEL_EMPTY_RESPONSE"
+    assert raised.value.__cause__ is None
+
+
+def test_live_generation_error_preserves_wrapped_cause_class(monkeypatch):
+    from google import genai
+
+    class ProviderFailure(Exception):
+        status_code = 400
+
+    class Models:
+        def generate_content(self, **kwargs):
+            raise ProviderFailure("private provider details")
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.models = Models()
+
+    monkeypatch.setattr(genai, "Client", Client)
+    with pytest.raises(DraftGenerationError) as raised:
+        generate_draft(
+            "How much is the Bole 2 bedroom apartment?",
+            get_property("bole_apartment_2bed"),
+            mock_mode=False,
+            api_key="test-not-a-real-key",
+        )
+
+    assert raised.value.category == "DRAFT_GENERATION_FAILED"
+    assert isinstance(raised.value.__cause__, ProviderFailure)
 
 
 def test_numeric_hallucination_escalates(monkeypatch):

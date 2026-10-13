@@ -11,6 +11,16 @@ from .retry import with_transient_retry
 
 ESCALATION_TEXT = "[ESCALATE: Unknown Property Parameter]"
 MODEL_NAME = "gemini-2.5-flash"
+DRAFT_FAILURE_CATEGORIES = frozenset(
+    {
+        "INPUT_TOO_LONG",
+        "DRAFT_GENERATION_FAILED",
+        "MODEL_EMPTY_RESPONSE",
+        "PROPERTY_CONTEXT_FAILED",
+        "PERSISTENCE_FAILED",
+        "UNEXPECTED_PIPELINE_ERROR",
+    }
+)
 
 # Deterministic claim vocabulary. If a generated draft uses one of these
 # fact-bearing terms, the term must be supported by the verified property
@@ -70,6 +80,19 @@ _BEDROOM_CLAIM = re.compile(r"\b(\d+)\s*(?:bed(?:room)?s?|br)\b")
 
 class DraftGenerationError(RuntimeError):
     """A draft could not be generated or safely validated."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "DRAFT_GENERATION_FAILED",
+    ) -> None:
+        self.category = (
+            category
+            if category in DRAFT_FAILURE_CATEGORIES
+            else "DRAFT_GENERATION_FAILED"
+        )
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -541,7 +564,10 @@ def generate_draft(
 
     text = (getattr(response, "text", None) or "").strip()
     if not text:
-        raise DraftGenerationError("Gemini returned an empty response")
+        raise DraftGenerationError(
+            "Gemini returned an empty response",
+            category="MODEL_EMPTY_RESPONSE",
+        )
     if ESCALATION_TEXT.casefold() in text.casefold():
         return DraftResult(ESCALATION_TEXT, True, "Unknown Property Parameter", model)
 

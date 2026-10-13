@@ -1,0 +1,1 @@
+- [ASTER inquiry safety](aster-inquiry-safety.md) — preserve manual founder replies, mandatory AI approval, verified-data grounding, and clear failure/review outcomes.

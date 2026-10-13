@@ -3,9 +3,11 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from real_estate_mvp.bot import prepare_inquiry, recover_pending_inquiries
 from real_estate_mvp.config import Settings
+from real_estate_mvp.draft import DraftGenerationError
 from real_estate_mvp.storage import JSONLStore
 
 
@@ -25,6 +27,53 @@ def mock_settings(data_dir: Path) -> Settings:
 
 
 class InquiryPipelineTests(unittest.IsolatedAsyncioTestCase):
+    def assert_failure_diagnostic(
+        self,
+        store: JSONLStore,
+        inquiry: dict,
+        *,
+        category: str,
+        stage: str,
+    ) -> dict:
+        self.assertEqual(inquiry["status"], "draft_failed")
+        self.assertIsNone(inquiry["draft"])
+        self.assertIsNone(inquiry.get("sent_at"))
+        self.assertEqual(inquiry["draft_error_category"], category)
+        self.assertEqual(inquiry["draft_error_stage"], stage)
+        event = next(
+            event
+            for event in store.list_events()
+            if event["event"] == "DRAFT_FAILED"
+            and event["inquiry_id"] == inquiry["inquiry_id"]
+        )
+        self.assertEqual(event["error_category"], category)
+        self.assertEqual(event["stage"], stage)
+        self.assertEqual(
+            set(event),
+            {
+                "timestamp",
+                "event",
+                "inquiry_id",
+                "error",
+                "error_category",
+                "stage",
+                "cause_class",
+                "upstream_status",
+                "message_length",
+                "mock_mode",
+            },
+        )
+        self.assertNotIn(inquiry["message"], str(event))
+        self.assertNotIn(
+            "SEND_SUCCESS",
+            [
+                record["event"]
+                for record in store.list_events()
+                if record["inquiry_id"] == inquiry["inquiry_id"]
+            ],
+        )
+        return event
+
     async def test_known_question_is_persisted_for_human_review_without_sending(self):
         with tempfile.TemporaryDirectory() as directory:
             store = JSONLStore(directory)
@@ -80,8 +129,190 @@ class InquiryPipelineTests(unittest.IsolatedAsyncioTestCase):
                 telegram_message_id="45",
                 message="Bole apartment " + ("question " * 500),
             )
-            self.assertEqual(inquiry["status"], "draft_failed")
+            event = self.assert_failure_diagnostic(
+                store,
+                inquiry,
+                category="INPUT_TOO_LONG",
+                stage="draft_input_validation",
+            )
+            self.assertEqual(event["error"], "DraftGenerationError")
+            self.assertGreater(event["message_length"], 4000)
+            self.assertTrue(event["mock_mode"])
             self.assertIsNone(inquiry["sent_at"])
+
+    async def test_property_context_failure_records_safe_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = JSONLStore(directory)
+            private_detail = "private context failure detail"
+            with patch(
+                "real_estate_mvp.bot.get_property_context",
+                side_effect=RuntimeError(private_detail),
+            ):
+                inquiry = await prepare_inquiry(
+                    store,
+                    mock_settings(Path(directory)),
+                    telegram_user_id="123",
+                    telegram_message_id="49",
+                    message="How much is the Bole 2 bedroom apartment?",
+                )
+
+            event = self.assert_failure_diagnostic(
+                store,
+                inquiry,
+                category="PROPERTY_CONTEXT_FAILED",
+                stage="property_context",
+            )
+            self.assertEqual(event["error"], "RuntimeError")
+            self.assertNotIn(private_detail, str(event))
+
+    async def test_generation_failure_records_error_and_cause_classes_only(self):
+        class ProviderFailure(Exception):
+            status_code = 429
+
+        def fail_generation(*args, **kwargs):
+            try:
+                raise ProviderFailure("secret-key and private buyer details")
+            except ProviderFailure as cause:
+                raise DraftGenerationError(
+                    "safe wrapper text",
+                    category="DRAFT_GENERATION_FAILED",
+                ) from cause
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = JSONLStore(directory)
+            with patch(
+                "real_estate_mvp.bot.generate_draft",
+                side_effect=fail_generation,
+            ):
+                inquiry = await prepare_inquiry(
+                    store,
+                    mock_settings(Path(directory)),
+                    telegram_user_id="123",
+                    telegram_message_id="50",
+                    message="How much is the Bole 2 bedroom apartment?",
+                )
+
+            event = self.assert_failure_diagnostic(
+                store,
+                inquiry,
+                category="DRAFT_GENERATION_FAILED",
+                stage="draft_generation",
+            )
+            self.assertEqual(event["error"], "DraftGenerationError")
+            self.assertEqual(event["cause_class"], "ProviderFailure")
+            self.assertEqual(event["upstream_status"], 429)
+            self.assertNotIn("secret-key", str(event))
+            self.assertNotIn("private buyer details", str(event))
+            self.assertEqual(inquiry["draft_error_cause_class"], "ProviderFailure")
+
+    async def test_empty_model_response_category_is_persisted(self):
+        def empty_response(*args, **kwargs):
+            raise DraftGenerationError(
+                "Gemini returned an empty response",
+                category="MODEL_EMPTY_RESPONSE",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = JSONLStore(directory)
+            with patch(
+                "real_estate_mvp.bot.generate_draft",
+                side_effect=empty_response,
+            ):
+                inquiry = await prepare_inquiry(
+                    store,
+                    mock_settings(Path(directory)),
+                    telegram_user_id="123",
+                    telegram_message_id="51",
+                    message="How much is the Bole 2 bedroom apartment?",
+                )
+
+            event = self.assert_failure_diagnostic(
+                store,
+                inquiry,
+                category="MODEL_EMPTY_RESPONSE",
+                stage="draft_generation",
+            )
+            self.assertEqual(event["error"], "DraftGenerationError")
+
+    async def test_pipeline_failure_and_persistence_failure_are_classified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = JSONLStore(directory)
+            with patch(
+                "real_estate_mvp.bot.find_relevant_properties",
+                side_effect=LookupError("private matcher detail"),
+            ):
+                unexpected = await prepare_inquiry(
+                    store,
+                    mock_settings(Path(directory)),
+                    telegram_user_id="123",
+                    telegram_message_id="52",
+                    message="How much is the Bole 2 bedroom apartment?",
+                )
+            event = self.assert_failure_diagnostic(
+                store,
+                unexpected,
+                category="UNEXPECTED_PIPELINE_ERROR",
+                stage="property_matching",
+            )
+            self.assertEqual(event["error"], "LookupError")
+            self.assertNotIn("private matcher detail", str(event))
+
+            original_append = store.append_event
+            should_fail = True
+
+            def fail_draft_started_once(event_name, inquiry_id=None, **details):
+                nonlocal should_fail
+                if event_name == "DRAFT_STARTED" and should_fail:
+                    should_fail = False
+                    raise OSError("private persistence path")
+                return original_append(event_name, inquiry_id, **details)
+
+            with patch.object(store, "append_event", side_effect=fail_draft_started_once):
+                persistence_failure = await prepare_inquiry(
+                    store,
+                    mock_settings(Path(directory)),
+                    telegram_user_id="123",
+                    telegram_message_id="53",
+                    message="How much is the Bole 2 bedroom apartment?",
+                )
+            event = self.assert_failure_diagnostic(
+                store,
+                persistence_failure,
+                category="PERSISTENCE_FAILED",
+                stage="draft_start_persistence",
+            )
+            self.assertEqual(event["error"], "OSError")
+            self.assertNotIn("private persistence path", str(event))
+
+            should_fail_result_event = True
+
+            def fail_draft_created_once(event_name, inquiry_id=None, **details):
+                nonlocal should_fail_result_event
+                if event_name == "DRAFT_CREATED" and should_fail_result_event:
+                    should_fail_result_event = False
+                    raise OSError("private result persistence detail")
+                return original_append(event_name, inquiry_id, **details)
+
+            with patch.object(
+                store,
+                "append_event",
+                side_effect=fail_draft_created_once,
+            ):
+                result_persistence_failure = await prepare_inquiry(
+                    store,
+                    mock_settings(Path(directory)),
+                    telegram_user_id="123",
+                    telegram_message_id="54",
+                    message="How much is the Bole 2 bedroom apartment?",
+                )
+            event = self.assert_failure_diagnostic(
+                store,
+                result_persistence_failure,
+                category="PERSISTENCE_FAILED",
+                stage="draft_result_persistence",
+            )
+            self.assertEqual(event["error"], "OSError")
+            self.assertNotIn("private result persistence detail", str(event))
 
     async def test_restart_preserves_review_queue(self):
         with tempfile.TemporaryDirectory() as directory:

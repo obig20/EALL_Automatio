@@ -119,6 +119,42 @@ class ReviewQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manual["status"], "sent")
         self.assertEqual(sent[0][1], "I will confirm this detail with the team.")
 
+    async def test_failed_ai_draft_cannot_be_approved_but_manual_send_remains_available(self):
+        failed_inquiry = self.store.update_inquiry(
+            self.inquiry["inquiry_id"],
+            status="draft_failed",
+            draft=None,
+            draft_error="DraftGenerationError",
+            draft_error_category="DRAFT_GENERATION_FAILED",
+        )
+        self.assertIn(
+            "No AI draft. Review manually.",
+            format_review_message(failed_inquiry),
+        )
+        sent = []
+
+        async def send_message(chat_id, text):
+            sent.append((chat_id, text))
+
+        automatic = await self.queue.approve_and_send(
+            self.inquiry["inquiry_id"],
+            actor_user_id=777,
+            chat_id=777,
+            send_message=send_message,
+        )
+        self.assertEqual(automatic["status"], "not_approvable")
+        self.assertEqual(sent, [])
+
+        manual = await self.queue.manual_send(
+            self.inquiry["inquiry_id"],
+            "I will confirm this detail with the team.",
+            actor_user_id=777,
+            chat_id=777,
+            send_message=send_message,
+        )
+        self.assertEqual(manual["status"], "sent")
+        self.assertEqual(sent, [(123, "I will confirm this detail with the team.")])
+
     async def test_transient_failure_retries_and_persists_attempts(self):
         sends = 0
 
