@@ -34,3 +34,46 @@ def test_deterministic_property_matching():
     assert find_relevant_properties("Tell me about the Summit villa") == ["summit_villa"]
     assert find_relevant_properties("Hi there") == []
     assert find_relevant_properties("") == []
+
+
+def test_villa_request_rejects_apartment_records():
+    """A villa request must never be satisfied by an apartment record."""
+    assert find_relevant_properties("three bedroom villa") == []
+    assert find_relevant_properties("3 bedroom villa") == []
+    assert find_relevant_properties(
+        "I'm looking for a three-bedroom villa in an area you haven't listed"
+    ) == []
+    # The only villa in the catalog is 4 bedrooms, so a 3-bedroom villa
+    # request has no compatible listing even though a 3-bedroom apartment
+    # exists.
+    assert find_relevant_properties("I want a villa") == ["summit_villa"]
+
+
+def test_compatible_property_type_matches():
+    """Specific type nouns constrain the catalog to a compatible group."""
+    assert find_relevant_properties("3 bedroom apartment") == ["bole_apartment_3bed"]
+    assert find_relevant_properties("apartment in Bole") == [
+        "bole_apartment_2bed",
+        "bole_apartment_3bed",
+    ]
+    assert find_relevant_properties("Bole 2 bedroom apartment") == [
+        "bole_apartment_2bed"
+    ]
+
+
+def test_ambiguous_type_returns_multiple_candidates():
+    """When several compatible listings match, all of them are returned."""
+    results = find_relevant_properties("apartment")
+    assert set(results) == {
+        "bole_apartment_2bed",
+        "bole_apartment_3bed",
+        "kazanchis_apartment",
+    }
+
+
+def test_generic_house_word_does_not_constrain_type():
+    """"House" is loose enough to mean "property", so Bole apartments still match."""
+    assert find_relevant_properties("How much is the house in Bole?") == [
+        "bole_apartment_2bed",
+        "bole_apartment_3bed",
+    ]

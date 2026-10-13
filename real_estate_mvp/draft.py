@@ -80,6 +80,50 @@ class DraftResult:
     model: str = "mock"
 
 
+def _normalize_property_data(
+    property_data: dict[str, Any] | list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Collapse multiple verified candidates into one grounding record.
+
+    A draft that summarizes several candidates must be grounded in the
+    union of their facts, not in any single record: a fact supported by one
+    candidate must not be rejected because it is absent from another.
+    Scalar fields such as price, location, payment plan, and availability
+    differ per candidate, so every distinct value is preserved. List fields
+    such as amenities are merged and de-duplicated.
+    """
+    if isinstance(property_data, list):
+        if not property_data:
+            return None
+        merged: dict[str, Any] = {}
+        scalars: dict[str, list[Any]] = {}
+        for record in property_data:
+            if not isinstance(record, dict):
+                continue
+            for key, value in record.items():
+                if key in {"name", "property_id", "property_type"}:
+                    merged.setdefault(key, value)
+                    continue
+                if isinstance(value, list):
+                    existing = merged.get(key)
+                    if isinstance(existing, list) and isinstance(value, list):
+                        for item in value:
+                            if item not in existing:
+                                existing.append(item)
+                    elif isinstance(value, list):
+                        merged[key] = list(value)
+                elif value not in (None, ""):
+                    scalars.setdefault(key, [])
+                    if value not in scalars[key]:
+                        scalars[key].append(value)
+        for key, values in scalars.items():
+            merged[key] = values[0] if len(values) == 1 else values
+        return merged or None
+    if isinstance(property_data, dict):
+        return property_data
+    return None
+
+
 def _as_single_property(
     property_context: dict[str, Any] | list[dict[str, Any]] | None,
 ) -> dict[str, Any] | None:
@@ -90,6 +134,40 @@ def _as_single_property(
     if not isinstance(property_context, dict) or not property_context.get("name"):
         return None
     return property_context
+
+
+def _multi_property_summary(
+    property_context: list[dict[str, Any]], requested: set[str]
+) -> str:
+    """Grounded summary of several verified candidates.
+
+    Multiple candidates are returned when the evidence is insufficient to
+    pick one property. The summary lists only verified facts per candidate
+    and never asserts that any single candidate is the right one; it also
+    never invents a price, amenity, or availability figure.
+    """
+    lines: list[str] = []
+    for property_data in property_context:
+        name = property_data.get("name", "Unknown property")
+        details: list[str] = []
+        if "bedrooms" in requested and property_data.get("bedrooms") is not None:
+            details.append(f"{property_data['bedrooms']} bedrooms")
+        if "price" in requested and property_data.get("price"):
+            details.append(f"listed at {property_data['price']}")
+        if "location" in requested and property_data.get("location"):
+            details.append(f"in {property_data['location']}")
+        if "payment_plan" in requested and property_data.get("payment_plan"):
+            details.append(f"payment plan {property_data['payment_plan']}")
+        if "availability" in requested and property_data.get("availability"):
+            details.append(f"{property_data['availability']}")
+        if "amenities" in requested and property_data.get("amenities"):
+            details.append(
+                "amenities: " + ", ".join(str(item) for item in property_data["amenities"])
+            )
+        if not details:
+            details.append("verified details are available on request")
+        lines.append(f"- {name}: " + "; ".join(details) + ".")
+    return "\n".join(lines)
 
 
 def _greeting_only(message: str) -> bool:
@@ -283,8 +361,31 @@ def _term_supported(term: str, data_text: str) -> bool:
     return False
 
 
+def _allowed_bedrooms(
+    property_data: dict[str, Any] | list[dict[str, Any]] | None,
+) -> set[int]:
+    """Every bedroom count documented by any verified candidate.
+
+    A draft that summarizes several candidates may legitimately mention
+    more than one bedroom count, so the validator accepts any count that
+    appears in at least one verified record.
+    """
+    if isinstance(property_data, list):
+        counts = {
+            record.get("bedrooms")
+            for record in property_data
+            if isinstance(record, dict) and isinstance(record.get("bedrooms"), int)
+        }
+        return counts  # type: ignore[return-value]
+    if isinstance(property_data, dict):
+        bedrooms = property_data.get("bedrooms")
+        return {bedrooms} if isinstance(bedrooms, int) else set()  # type: ignore[return-value]
+    return set()
+
+
 def validate_draft(
-    text: str, property_data: dict[str, Any]
+    text: str,
+    property_data: dict[str, Any] | list[dict[str, Any]] | None,
 ) -> tuple[bool, str | None]:
     """Deterministic grounding check for generated draft text.
 
@@ -293,19 +394,28 @@ def validate_draft(
     claims must be supported by the data, and marketing/urgency/advice
     phrases are always rejected. When a claim cannot be confidently
     grounded, the draft is escalated instead of being released to review.
+
+    Multiple verified candidates are merged into the union of their facts
+    before grounding, so a draft that summarizes several candidates is not
+    rejected merely because a fact is absent from one of them. Bedroom
+    counts are accepted when they appear in any candidate.
     """
-    # 1. Bedroom counts must match the verified record exactly. This
-    #    runs before the generic numeric guard because a wrong count
-    #    can otherwise hide behind a number that exists elsewhere in
-    #    the record (e.g. an availability figure).
-    bedrooms = property_data.get("bedrooms")
+    data = _normalize_property_data(property_data)
+    if data is None:
+        return False, "No verified property data available for grounding"
+
+    # 1. Bedroom counts must be documented by at least one verified
+    #    record. This runs before the generic numeric guard because a
+    #    wrong count can otherwise hide behind a number that exists
+    #    elsewhere in the record (e.g. an availability figure).
+    allowed_bedrooms = _allowed_bedrooms(property_data)
     for match in _BEDROOM_CLAIM.finditer(text.casefold()):
-        if isinstance(bedrooms, int) and int(match.group(1)) != bedrooms:
+        if allowed_bedrooms and int(match.group(1)) not in allowed_bedrooms:
             return False, "Unsupported bedroom count in generated draft"
 
     # 2. Numeric claims: buyer-provided and model-invented numbers are
     #    untrusted; only numbers present in the verified data are allowed.
-    allowed_numbers = _grounding_numbers(_property_data_text(property_data))
+    allowed_numbers = _grounding_numbers(_property_data_text(data))
     output_numbers = _grounding_numbers(text)
     if not output_numbers.issubset(allowed_numbers):
         return False, "Unsupported numeric claim in generated draft"
@@ -317,7 +427,7 @@ def validate_draft(
             return False, "Unsupported marketing, urgency, or advice claim in generated draft"
 
     # 4. Fact-bearing vocabulary must be supported by the verified data.
-    data_text = _property_data_text(property_data)
+    data_text = _property_data_text(data)
     for category, terms in CLAIM_VOCABULARY.items():
         for term in terms:
             pattern = rf"\b{re.escape(term)}\b"
@@ -370,6 +480,22 @@ def generate_draft(
     if property_data is None and _greeting_only(buyer_message):
         return DraftResult(_mock_response(buyer_message, None, []))
     if property_data is None:
+        if isinstance(property_context, list) and len(property_context) > 1:
+            requested = _requested_fields(buyer_message)
+            # A multi-candidate summary must be grounded in the union of
+            # every candidate's facts, not in a single record.
+            merged = _normalize_property_data(property_context) or {}
+            summary = _multi_property_summary(property_context, requested)
+            text = (
+                "Several verified listings match your question, so I am not "
+                "picking one for you:\n\n" + summary + "\n\n"
+                "Which property would you like me to focus on? If you need a "
+                "detail not listed above, say so and I will confirm it or "
+                "escalate to the team."
+            )
+            grounded, validation_reason = validate_draft(text, merged)
+            if grounded:
+                return DraftResult(text)
         return DraftResult(
             ESCALATION_TEXT, requires_escalation=True, reason="Unknown Property Parameter"
         )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import time
 
 from .bot import build_application, prepare_inquiry
 from .config import get_settings
@@ -171,9 +172,35 @@ def main() -> None:
         asyncio.run(_mock_console(settings, store))
         return
 
-    application = build_application(settings)
-    logger.info("[SUCCESS] Telegram polling started; AI drafts require founder approval")
-    application.run_polling(drop_pending_updates=False)
+    run_live_polling(build_application(settings), settings)
+
+
+def run_live_polling(application, settings: Settings) -> None:
+    """Run Telegram polling, rebuilding and retrying on transient failure.
+
+    python-telegram-bot's bootstrap retry loop has bootstrap_retries=0 by
+    default, so a transient ConnectTimeout during get_me()/initialize()
+    aborts the process. A temporary network blip at startup must not kill
+    the bot; wrap polling in an outer loop that rebuilds and retries with
+    backoff. Only KeyboardInterrupt or a genuinely unrecoverable
+    configuration error stops the process.
+    """
+    retry_delay = 5
+    current = application
+    while True:
+        try:
+            current.run_polling(drop_pending_updates=False)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.error(
+                "[ERROR] polling terminated (%s); restarting in %ss",
+                exc.__class__.__name__,
+                retry_delay,
+            )
+        time.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, 60)
+        current = build_application(settings)
 
 
 if __name__ == "__main__":

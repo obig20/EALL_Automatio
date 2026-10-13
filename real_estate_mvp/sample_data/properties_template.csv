@@ -1,0 +1,5 @@
+property_id,name,property_type,location,bedrooms,price,downpayment,payment_schedule,amenities,availability,images,source,last_updated
+p001,Bole 2 Bedroom Apartment,Apartment,Bole near Atlas,2,12000000 ETB,30%,balance over 24 months,24-hour security|elevator,available,,https://example.com/p001.jpg,Acme Imports,2026-10-11
+p002,Bole 3 Bedroom Apartment,Apartment,Bole near Atlas,3,18000000 ETB,35%,balance over 24 months,24-hour security|elevator,available,,https://example.com/p002.jpg,Acme Imports,2026-10-11
+p003,Summit Family Villa,Villa,Summit Addis Ababa,4,28500000 ETB,40%,balance over 18 months,private garden|covered parking,sold,,https://example.com/p003.jpg,Acme Imports,2026-10-11
+p004,Kazanchis 1 Bedroom Apartment,Apartment,Kazanchis Addis Ababa,1,9200000 ETB,30%,balance over 24 months,elevator,available,,https://example.com/p004.jpg,Acme Imports,2026-10-11

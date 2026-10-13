@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
@@ -69,7 +70,13 @@ async def with_transient_retry_async(
     wait_min_seconds: int = 4,
     wait_max_seconds: int = 10,
 ) -> T:
-    """Async counterpart used for Telegram network operations."""
+    """Async counterpart used for Telegram network operations.
+
+    Tenacity's AsyncRetrying only awaits the callable when it is itself a
+    coroutine function. Call sites pass either an ``async def`` function or
+    a ``lambda: coro()``; both must be awaited on every attempt, so we route
+    through a coroutine wrapper that awaits whatever ``operation`` returns.
+    """
     retryer = AsyncRetrying(
         retry=retry_if_exception(is_transient_error),
         wait=wait_exponential(
@@ -78,4 +85,11 @@ async def with_transient_retry_async(
         stop=stop_after_attempt(attempts),
         reraise=True,
     )
-    return await retryer(operation)
+
+    async def _runner() -> T:
+        result = operation()
+        if inspect.isawaitable(result):
+            return await result  # type: ignore[no-any-return]
+        return result  # type: ignore[no-any-return]
+
+    return await retryer(_runner)

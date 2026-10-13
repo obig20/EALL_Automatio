@@ -41,13 +41,24 @@ def test_greeting_is_safe_without_property_match():
     assert not result.requires_escalation
 
 
-def test_missing_property_escalates_and_ambiguous_property_escalates():
+def test_missing_property_escalates_and_ambiguous_property_lists_candidates():
+    """A missing property escalates; an ambiguous match lists candidates.
+
+    When several verified listings match, the assistant must not silently
+    pick one. It returns a grounded summary of every candidate instead of
+    escalating, and never asserts that any single candidate is correct.
+    """
     assert generate_draft("How much is it?", None).requires_escalation
     ambiguous = [
         get_property("bole_apartment_2bed"),
         get_property("bole_apartment_3bed"),
     ]
-    assert generate_draft("How much is the Bole apartment?", ambiguous).requires_escalation
+    result = generate_draft("How much is the Bole apartment?", ambiguous)
+    assert not result.requires_escalation
+    assert "Bole 2 Bedroom Apartment" in result.text
+    assert "Bole 3 Bedroom Apartment" in result.text
+    assert "12,000,000 ETB" in result.text
+    assert "18,000,000 ETB" in result.text
 
 
 def test_empty_input_fails_explicitly():
