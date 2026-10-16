@@ -89,7 +89,7 @@ def test_duplicate_while_pending_does_not_redraft(tmp_path):
             message="How much is the Bole 2 bedroom apartment?",
             telegram_chat_id=123,
         )
-        assert first["status"] == "awaiting_review"
+        assert first["status"] == "escalated"
         events_before = len(store.list_events())
         redelivered = await prepare_inquiry(
             store,
@@ -105,7 +105,7 @@ def test_duplicate_while_pending_does_not_redraft(tmp_path):
         assert redelivered["draft"] == first["draft"]
         events = [event["event"] for event in store.list_events()]
         assert events.count("INQUIRY_RECEIVED") == 1
-        assert events.count("DRAFT_CREATED") == 1
+        assert events.count("ESCALATION") == 1
         assert events.count("DUPLICATE_DELIVERY") == 1
         assert len(store.list_events()) == events_before + 1
 

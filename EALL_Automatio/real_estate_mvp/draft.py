@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .catalog import is_verified_property
 from .retry import with_transient_retry
 
 ESCALATION_TEXT = "[ESCALATE: Unknown Property Parameter]"
@@ -422,7 +423,22 @@ def validate_draft(
     before grounding, so a draft that summarizes several candidates is not
     rejected merely because a fact is absent from one of them. Bedroom
     counts are accepted when they appear in any candidate.
+
+    Unverified, demo, imported, or missing-provenance records fail this check
+    immediately and can never serve as grounding data.
     """
+    if property_data is None:
+        return False, "No verified property data available for grounding"
+
+    if isinstance(property_data, list):
+        if not property_data or any(not is_verified_property(p) for p in property_data):
+            return False, "Unverified property record cannot be used for grounding"
+    elif isinstance(property_data, dict):
+        if not is_verified_property(property_data):
+            return False, "Unverified property record cannot be used for grounding"
+    else:
+        return False, "No verified property data available for grounding"
+
     data = _normalize_property_data(property_data)
     if data is None:
         return False, "No verified property data available for grounding"
@@ -499,15 +515,28 @@ def generate_draft(
     """Generate a grounded draft or return the mandatory escalation sentinel."""
     if not buyer_message or not buyer_message.strip():
         raise DraftGenerationError("Cannot draft a response to an empty message")
-    property_data = _as_single_property(property_context)
-    if property_data is None and _greeting_only(buyer_message):
+    if _greeting_only(buyer_message):
         return DraftResult(_mock_response(buyer_message, None, []))
+
+    property_data = _as_single_property(property_context)
+    if property_data is not None and not is_verified_property(property_data):
+        return DraftResult(
+            ESCALATION_TEXT,
+            requires_escalation=True,
+            reason="Unverified Property Record",
+        )
+
     if property_data is None:
         if isinstance(property_context, list) and len(property_context) > 1:
+            if any(not is_verified_property(p) for p in property_context):
+                return DraftResult(
+                    ESCALATION_TEXT,
+                    requires_escalation=True,
+                    reason="Unverified Property Record",
+                )
             requested = _requested_fields(buyer_message)
             # A multi-candidate summary must be grounded in the union of
             # every candidate's facts, not in a single record.
-            merged = _normalize_property_data(property_context) or {}
             summary = _multi_property_summary(property_context, requested)
             text = (
                 "Several verified listings match your question, so I am not "
@@ -516,7 +545,7 @@ def generate_draft(
                 "detail not listed above, say so and I will confirm it or "
                 "escalate to the team."
             )
-            grounded, validation_reason = validate_draft(text, merged)
+            grounded, validation_reason = validate_draft(text, property_context)
             if grounded:
                 return DraftResult(text)
         return DraftResult(

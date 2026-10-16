@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import tempfile
 from dataclasses import replace
 from pathlib import Path
@@ -37,6 +39,20 @@ SYNTHETIC_MESSAGES = [
 
 
 def _settings(data_dir: Path) -> Settings:
+    sim_properties = data_dir / "sim_properties.json"
+    if not sim_properties.exists():
+        demo_catalog = json.loads(
+            (Path(__file__).resolve().parent / "data" / "properties.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for pid, pdata in demo_catalog.items():
+            if not pid.startswith("_") and isinstance(pdata, dict):
+                pdata["verified"] = True
+                pdata["provenance"] = "verified"
+        sim_properties.write_text(
+            json.dumps(demo_catalog, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     return Settings(
         telegram_bot_token="",
         founder_chat_id="",
@@ -47,7 +63,7 @@ def _settings(data_dir: Path) -> Settings:
         uncovered_end_hour=21,
         agent_names=("Agent", "Sales", "Admin"),
         data_dir=data_dir,
-        properties_file=Path(__file__).resolve().parent / "data" / "properties.json",
+        properties_file=sim_properties,
     )
 
 
@@ -229,7 +245,37 @@ async def _run_simulation(data_dir: Path) -> dict:
 
 def run_stress_simulation() -> dict:
     with tempfile.TemporaryDirectory(prefix="aster-mvp-") as directory:
-        return asyncio.run(_run_simulation(Path(directory)))
+        sim_properties = Path(directory) / "sim_properties.json"
+        # Write verified catalog into the temp dir so _settings can find it.
+        # (It will be created again by _settings if absent, but pre-creating
+        # it here lets us set the env var before importing anything that
+        # caches the path.)
+        demo_catalog = json.loads(
+            (Path(__file__).resolve().parent / "data" / "properties.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for pid, pdata in demo_catalog.items():
+            if not pid.startswith("_") and isinstance(pdata, dict):
+                pdata["verified"] = True
+                pdata["provenance"] = "verified"
+        sim_properties.write_text(
+            json.dumps(demo_catalog, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        # knowledge.py resolves the catalog via get_settings() from env, not
+        # from the Settings object passed to prepare_inquiry. Set PROPERTIES_FILE
+        # so that all property lookups during the simulation use the verified
+        # sim catalog, and restore the original value when we're done.
+        prev = os.environ.get("PROPERTIES_FILE")
+        os.environ["PROPERTIES_FILE"] = str(sim_properties)
+        try:
+            return asyncio.run(_run_simulation(Path(directory)))
+        finally:
+            if prev is None:
+                os.environ.pop("PROPERTIES_FILE", None)
+            else:
+                os.environ["PROPERTIES_FILE"] = prev
 
 
 def main() -> None:

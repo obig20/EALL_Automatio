@@ -7,11 +7,32 @@ import inspect
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from .catalog import (
+    PROVENANCE_DEMO,
+    PROVENANCE_IMPORTED,
+    PROVENANCE_UNVERIFIED,
+    PROVENANCE_VERIFIED,
+    is_verified_property,
+)
 from .retry import with_transient_retry_async
 from .storage import JSONLStore
 from .utils import now_iso
 
 SendFunction = Callable[[int, str], Awaitable[Any] | Any]
+
+
+def property_provenance_label(property_data: dict[str, Any]) -> str:
+    """Return an accurate human-readable provenance label for review display."""
+    if is_verified_property(property_data):
+        return "VERIFIED LISTING — confirmed active property"
+    provenance = property_data.get("provenance")
+    if provenance == PROVENANCE_DEMO or not provenance:
+        return "DEMO DATA — not a current real listing"
+    if provenance == PROVENANCE_IMPORTED:
+        return "IMPORTED DATA (UNVERIFIED) — not verified for buyer replies"
+    if provenance == PROVENANCE_UNVERIFIED:
+        return "UNVERIFIED DATA — not verified for buyer replies"
+    return f"UNVERIFIED DATA ({provenance}) — not verified for buyer replies"
 
 
 def format_review_message(inquiry: dict[str, Any]) -> str:
@@ -28,14 +49,14 @@ def format_review_message(inquiry: dict[str, Any]) -> str:
         "BUYER MESSAGE:",
         inquiry.get("message", ""),
         "",
-        "VERIFIED PROPERTY DATA:",
+        "PROPERTY DATA:",
     ]
     contexts = inquiry.get("property_context") or []
     if contexts:
         for property_data in contexts:
             lines.extend(
                 [
-                    "DEMO DATA — not a current real listing",
+                    property_provenance_label(property_data),
                     f"Property: {property_data.get('name', 'Unknown')}",
                     f"Type: {property_data.get('property_type', 'Not documented')}",
                     f"Bedrooms: {property_data.get('bedrooms', 'Not documented')}",
@@ -223,6 +244,12 @@ class ReviewQueue:
                 or inquiry.get("requires_escalation")
             ):
                 return {"ok": False, "status": "invalid_draft", "inquiry": inquiry}
+
+            contexts = inquiry.get("property_context") or []
+            if not contexts and inquiry.get("matched_properties"):
+                return {"ok": False, "status": "unverified_property", "inquiry": inquiry}
+            if any(not is_verified_property(p) for p in contexts):
+                return {"ok": False, "status": "unverified_property", "inquiry": inquiry}
 
             inquiry = self.store.update_inquiry(
                 inquiry_id,

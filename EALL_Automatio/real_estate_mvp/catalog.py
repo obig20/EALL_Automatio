@@ -436,14 +436,27 @@ def normalize_property_record(record: dict[str, Any]) -> dict[str, Any]:
     # real imported listing.
     if "verified" in record:
         normalized["verified"] = bool(record["verified"])
+    else:
+        normalized["verified"] = False
+
     if "provenance" in record and record["provenance"]:
         normalized["provenance"] = record["provenance"]
     elif "imported_at" in record and record["imported_at"]:
         normalized.setdefault("provenance", PROVENANCE_IMPORTED)
     elif "verified" not in record and "provenance" not in record:
         normalized.setdefault("provenance", PROVENANCE_DEMO)
-    if "verified" in record and record["verified"]:
-        normalized["provenance"] = PROVENANCE_VERIFIED
     elif "verified" in record and not record["verified"]:
         normalized.setdefault("provenance", PROVENANCE_UNVERIFIED)
     return normalized
+
+
+def is_verified_property(record: dict[str, Any] | None) -> bool:
+    """Check whether a property record is verified.
+
+    Only property records explicitly marked with BOTH ``verified is True``
+    and ``provenance == 'verified'`` may supply property facts to
+    buyer-facing drafts. Missing, demo, imported, or unverified records fail.
+    """
+    if not isinstance(record, dict):
+        return False
+    return record.get("verified") is True and record.get("provenance") == PROVENANCE_VERIFIED

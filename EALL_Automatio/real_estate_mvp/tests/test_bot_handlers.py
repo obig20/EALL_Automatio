@@ -113,7 +113,7 @@ async def _test_duplicate_delivery_in_handler(tmp_path):
 
     await buyer_text(update, _fake_context(store, settings, limiter))
     assert len(store.list_inquiries()) == 1
-    assert store.list_inquiries()[0]["status"] == "awaiting_review"
+    assert store.list_inquiries()[0]["status"] == "escalated"
 
     # Telegram redelivers the same chat + message ID.
     redelivery = _fake_update(123, 123, 42, "How much is the Bole 2 bedroom apartment?")
@@ -122,7 +122,7 @@ async def _test_duplicate_delivery_in_handler(tmp_path):
     assert len(inquiries) == 1
     events = [event["event"] for event in store.list_events()]
     assert events.count("INQUIRY_RECEIVED") == 1
-    assert events.count("DRAFT_CREATED") == 1
+    assert events.count("ESCALATION") == 1
     assert events.count("DUPLICATE_DELIVERY") == 1
 
 

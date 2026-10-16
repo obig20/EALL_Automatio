@@ -32,6 +32,8 @@ class ReviewQueueTests(unittest.IsolatedAsyncioTestCase):
                     "payment_plan": "30% downpayment, balance over 24 months",
                     "availability": "3 demo units remaining",
                     "amenities": [],
+                    "verified": True,
+                    "provenance": "verified",
                 }
             ],
         )
@@ -289,6 +291,70 @@ class ReviewQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "sent")
         self.assertEqual(sent, [(123, "Founder-reviewed response")])
 
+    async def test_approve_and_send_rejects_unverified_records_in_context(self):
+        cases = [
+            ("demo", {"name": "Demo", "provenance": "demo", "verified": False}),
+            ("imported", {"name": "Imported", "provenance": "imported", "verified": False}),
+            ("unverified", {"name": "Unverified", "provenance": "unverified", "verified": False}),
+            ("missing_provenance", {"name": "Missing", "verified": True}),
+            ("missing_verified", {"name": "Missing Flag", "provenance": "verified"}),
+        ]
+        for idx, (label, prop_data) in enumerate(cases):
+            inq = self.store.create_inquiry(
+                telegram_user_id=123,
+                telegram_message_id=999 + idx,
+                message="Question",
+            )
+            self.store.update_inquiry(
+                inq["inquiry_id"],
+                status="awaiting_review",
+                draft="Some draft",
+                property_context=[prop_data],
+            )
+            sent = []
+            res = await self.queue.approve_and_send(
+                inq["inquiry_id"],
+                actor_user_id=777,
+                chat_id=777,
+                send_message=lambda *args: sent.append(args),
+            )
+            self.assertEqual(res["status"], "unverified_property", f"Failed for {label}")
+            self.assertEqual(sent, [], f"Sent message for {label}")
+
+    async def test_manual_send_works_even_when_property_is_unverified(self):
+        inq = self.store.create_inquiry(
+            telegram_user_id=123,
+            telegram_message_id=888,
+            message="Question",
+        )
+        self.store.update_inquiry(
+            inq["inquiry_id"],
+            status="awaiting_review",
+            draft="Draft from demo",
+            property_context=[{"name": "Demo", "provenance": "demo", "verified": False}],
+        )
+        sent = []
+        # AI approval is blocked
+        res_approve = await self.queue.approve_and_send(
+            inq["inquiry_id"],
+            actor_user_id=777,
+            chat_id=777,
+            send_message=lambda *args: sent.append(args),
+        )
+        self.assertEqual(res_approve["status"], "unverified_property")
+        self.assertEqual(sent, [])
+
+        # Founder manual send succeeds
+        res_manual = await self.queue.manual_send(
+            inq["inquiry_id"],
+            "Manual response from founder",
+            actor_user_id=777,
+            chat_id=777,
+            send_message=lambda chat_id, text: sent.append((chat_id, text)),
+        )
+        self.assertEqual(res_manual["status"], "sent")
+        self.assertEqual(sent, [(123, "Manual response from founder")])
+
 
 def test_review_message_marks_sample_facts_and_escalation():
     # Reuse a minimal in-memory-looking record to keep this formatting test isolated.
@@ -307,3 +373,49 @@ def test_review_message_marks_sample_facts_and_escalation():
     assert "DEMO DATA" in message
     assert "ESCALATION REQUIRED" in message
     assert ESCALATION_TEXT in message
+
+
+def test_review_message_displays_accurate_provenance_labels():
+    msg_verified = format_review_message(
+        {
+            "inquiry_id": "inq_000001",
+            "status": "awaiting_review",
+            "property_context": [
+                {"name": "V", "verified": True, "provenance": "verified"}
+            ],
+        }
+    )
+    assert "VERIFIED LISTING" in msg_verified
+
+    msg_demo = format_review_message(
+        {
+            "inquiry_id": "inq_000002",
+            "status": "escalated",
+            "property_context": [
+                {"name": "D", "verified": False, "provenance": "demo"}
+            ],
+        }
+    )
+    assert "DEMO DATA" in msg_demo
+
+    msg_imported = format_review_message(
+        {
+            "inquiry_id": "inq_000003",
+            "status": "escalated",
+            "property_context": [
+                {"name": "I", "verified": False, "provenance": "imported"}
+            ],
+        }
+    )
+    assert "IMPORTED DATA (UNVERIFIED)" in msg_imported
+
+    msg_unverified = format_review_message(
+        {
+            "inquiry_id": "inq_000004",
+            "status": "escalated",
+            "property_context": [
+                {"name": "U", "verified": False, "provenance": "unverified"}
+            ],
+        }
+    )
+    assert "UNVERIFIED DATA" in msg_unverified

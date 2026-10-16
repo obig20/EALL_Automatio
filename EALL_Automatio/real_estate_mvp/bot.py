@@ -20,6 +20,7 @@ from telegram.ext import (
     filters,
 )
 
+from .catalog import is_verified_property
 from .config import Settings
 from .draft import DRAFT_FAILURE_CATEGORIES, DraftGenerationError, generate_draft
 from .knowledge import find_relevant_properties, get_property_context
@@ -194,8 +195,14 @@ def _prepare_review_keyboard(
             ]
         )
     rows = []
-    if inquiry.get("status") == "awaiting_review" and not inquiry.get(
-        "requires_escalation"
+    contexts = inquiry.get("property_context") or []
+    has_unverified_context = bool(contexts) and any(not is_verified_property(p) for p in contexts)
+    if not contexts and inquiry.get("matched_properties"):
+        has_unverified_context = True
+    if (
+        inquiry.get("status") == "awaiting_review"
+        and not inquiry.get("requires_escalation")
+        and not has_unverified_context
     ):
         rows.append(
             [InlineKeyboardButton("Approve & Send", callback_data=f"review:approve:{inquiry_id}")]

@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from real_estate_mvp.catalog import PROVENANCE_DEMO, is_verified_property
 from real_estate_mvp.knowledge import (
     find_relevant_properties,
     get_all_properties,
@@ -11,7 +12,11 @@ from real_estate_mvp.knowledge import (
 
 
 def test_lookup_and_demo_data_are_explicitly_marked():
-    assert get_property("bole_apartment_2bed")["bedrooms"] == 2
+    bole = get_property("bole_apartment_2bed")
+    assert bole["bedrooms"] == 2
+    assert bole["provenance"] == PROVENANCE_DEMO
+    assert bole.get("verified") is False
+    assert is_verified_property(bole) is False
     assert get_property("not_a_property") is None
     raw = json.loads(
         (Path(__file__).parents[1] / "data" / "properties.json").read_text(

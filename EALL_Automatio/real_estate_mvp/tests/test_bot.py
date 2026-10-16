@@ -77,7 +77,8 @@ class InquiryPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_known_question_is_persisted_for_human_review_without_sending(self):
         with tempfile.TemporaryDirectory() as directory:
             store = JSONLStore(directory)
-            inquiry = await prepare_inquiry(
+            # Demo properties escalate to protect buyers from synthetic data
+            demo_inquiry = await prepare_inquiry(
                 store,
                 mock_settings(Path(directory)),
                 telegram_user_id="123",
@@ -85,17 +86,46 @@ class InquiryPipelineTests(unittest.IsolatedAsyncioTestCase):
                 message="How much is the Bole 2 bedroom apartment?",
                 received_at="2026-10-02T12:30:00+03:00",
             )
-
-            self.assertEqual(inquiry["inquiry_id"], "inq_000001")
-            self.assertEqual(inquiry["status"], "awaiting_review")
-            self.assertEqual(inquiry["matched_properties"], ["bole_apartment_2bed"])
-            self.assertIn("12,000,000 ETB", inquiry["draft"])
-            self.assertIsNone(inquiry["sent_at"])
-            self.assertEqual(store.get_pending_inquiries()[0]["inquiry_id"], "inq_000001")
+            self.assertEqual(demo_inquiry["inquiry_id"], "inq_000001")
+            self.assertEqual(demo_inquiry["status"], "escalated")
+            self.assertTrue(demo_inquiry["requires_escalation"])
+            self.assertEqual(demo_inquiry["draft"], "[ESCALATE: Unknown Property Parameter]")
+            self.assertIsNone(demo_inquiry["sent_at"])
             events = [event["event"] for event in store.list_events()]
             self.assertIn("INQUIRY_RECEIVED", events)
-            self.assertIn("AWAITING_REVIEW", events)
+            self.assertIn("ESCALATION", events)
             self.assertNotIn("SEND_SUCCESS", events)
+
+            # Verified properties produce grounded drafts awaiting founder review
+            with patch(
+                "real_estate_mvp.bot.get_property_context",
+                lambda pid: {
+                    "name": "Bole 2 Bedroom Apartment",
+                    "property_type": "Apartment",
+                    "bedrooms": 2,
+                    "price": "12,000,000 ETB",
+                    "location": "Bole, near Atlas",
+                    "payment_plan": "30% downpayment, balance over 24 months",
+                    "availability": "3 units remaining",
+                    "amenities": [],
+                    "verified": True,
+                    "provenance": "verified",
+                },
+            ):
+                verified_inquiry = await prepare_inquiry(
+                    store,
+                    mock_settings(Path(directory)),
+                    telegram_user_id="124",
+                    telegram_message_id="43",
+                    message="How much is the Bole 2 bedroom apartment?",
+                    received_at="2026-10-02T12:31:00+03:00",
+                )
+                self.assertEqual(verified_inquiry["status"], "awaiting_review")
+                self.assertIn("12,000,000 ETB", verified_inquiry["draft"])
+                self.assertFalse(verified_inquiry["requires_escalation"])
+                self.assertIsNone(verified_inquiry["sent_at"])
+                new_events = [event["event"] for event in store.list_events()]
+                self.assertIn("AWAITING_REVIEW", new_events)
 
     async def test_unknown_amenity_escalates_and_is_saved(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -288,7 +318,7 @@ class InquiryPipelineTests(unittest.IsolatedAsyncioTestCase):
 
             def fail_draft_created_once(event_name, inquiry_id=None, **details):
                 nonlocal should_fail_result_event
-                if event_name == "DRAFT_CREATED" and should_fail_result_event:
+                if event_name in {"DRAFT_CREATED", "ESCALATION"} and should_fail_result_event:
                     should_fail_result_event = False
                     raise OSError("private result persistence detail")
                 return original_append(event_name, inquiry_id, **details)
@@ -327,7 +357,7 @@ class InquiryPipelineTests(unittest.IsolatedAsyncioTestCase):
             restarted = JSONLStore(directory)
             self.assertEqual(
                 restarted.get_inquiry(inquiry["inquiry_id"])["status"],
-                "awaiting_review",
+                "escalated",
             )
             self.assertEqual(len(restarted.get_pending_inquiries()), 1)
 
@@ -366,7 +396,7 @@ class InquiryPipelineTests(unittest.IsolatedAsyncioTestCase):
             await recover_pending_inquiries(app)
 
             recovered = store.get_inquiry(interrupted["inquiry_id"])
-            self.assertEqual(recovered["status"], "awaiting_review")
+            self.assertEqual(recovered["status"], "escalated")
             self.assertEqual(recovered["review_message_id"], 900)
             self.assertEqual(len(fake_bot.sent), 1)
             self.assertEqual(fake_bot.sent[0]["chat_id"], 777)
@@ -416,3 +446,28 @@ class InquiryPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fake_bot.edited[0]["message_id"], 55)
             self.assertEqual(fake_bot.sent, [])
             self.assertEqual(store.get_inquiry(interrupted["inquiry_id"])["status"], "sending")
+
+    def test_review_keyboard_omits_approve_for_unverified_records(self):
+        from real_estate_mvp.bot import _prepare_review_keyboard
+
+        unverified_inquiry = {
+            "inquiry_id": "inq_000001",
+            "status": "awaiting_review",
+            "requires_escalation": False,
+            "property_context": [{"name": "Demo", "provenance": "demo", "verified": False}],
+        }
+        keyboard = _prepare_review_keyboard(unverified_inquiry)
+        buttons = [btn.text for row in keyboard.inline_keyboard for btn in row]
+        self.assertNotIn("Approve & Send", buttons)
+        self.assertIn("Edit Manually", buttons)
+        self.assertIn("Reject", buttons)
+
+        verified_inquiry = {
+            "inquiry_id": "inq_000002",
+            "status": "awaiting_review",
+            "requires_escalation": False,
+            "property_context": [{"name": "Verified", "provenance": "verified", "verified": True}],
+        }
+        keyboard_verified = _prepare_review_keyboard(verified_inquiry)
+        buttons_v = [btn.text for row in keyboard_verified.inline_keyboard for btn in row]
+        self.assertIn("Approve & Send", buttons_v)

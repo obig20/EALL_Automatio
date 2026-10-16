@@ -24,9 +24,10 @@ def live_draft(monkeypatch, model_text: str, message: str, property_id: str):
         )
 
     monkeypatch.setattr(genai, "Client", fake_client)
+    prop = dict(get_property(property_id), verified=True, provenance="verified")
     return generate_draft(
         message,
-        get_property(property_id),
+        prop,
         mock_mode=False,
         api_key="synthetic-test-key",
     )
@@ -177,23 +178,29 @@ def test_grounded_availability_draft_is_accepted(monkeypatch):
 def test_mock_drafts_pass_their_own_validation():
     # Mock drafts are built from verified data, so they must remain
     # grounded; the validator is applied to them as a self-check.
+    verified_bole = dict(
+        get_property("bole_apartment_2bed"), verified=True, provenance="verified"
+    )
     result = generate_draft(
         "How much is the Bole 2 bedroom apartment?",
-        get_property("bole_apartment_2bed"),
+        verified_bole,
     )
     assert not result.requires_escalation
     assert result.text == "It is listed at 12,000,000 ETB."
 
 
 def test_mock_availability_and_payment_drafts_stay_grounded():
+    verified_summit = dict(
+        get_property("summit_villa"), verified=True, provenance="verified"
+    )
     availability = generate_draft(
         "Is the Summit villa available?",
-        get_property("summit_villa"),
+        verified_summit,
     )
     assert not availability.requires_escalation
     payment = generate_draft(
         "What is the payment plan for the Summit villa?",
-        get_property("summit_villa"),
+        verified_summit,
     )
     assert not payment.requires_escalation
 
@@ -226,6 +233,10 @@ def test_configured_gemini_settings_reach_the_live_api_call(
     from google import genai
 
     monkeypatch.setattr(genai, "Client", fake_client)
+    monkeypatch.setattr(
+        "real_estate_mvp.bot.get_property_context",
+        lambda pid: dict(get_property(pid), verified=True, provenance="verified"),
+    )
 
     settings = Settings(
         telegram_bot_token="",
@@ -281,12 +292,46 @@ def test_fractional_timeout_is_coerced_to_whole_seconds(monkeypatch):
         return SimpleNamespace(models=FakeModels())
 
     monkeypatch.setattr(genai, "Client", fake_client)
+    verified_kazanchis = dict(
+        get_property("kazanchis_apartment"), verified=True, provenance="verified"
+    )
     result = generate_draft(
         "How much is the Kazanchis apartment?",
-        get_property("kazanchis_apartment"),
+        verified_kazanchis,
         mock_mode=False,
         api_key="synthetic-test-key",
         timeout_seconds=17.5,
     )
     assert not result.requires_escalation
     assert captured["client"]["http_options"].timeout == 17
+
+
+def test_validation_backstop_blocks_unverified_records():
+    from real_estate_mvp.draft import validate_draft
+
+    demo_prop = get_property("kazanchis_apartment")
+    grounded_text = "It is listed at 9,200,000 ETB. The listed amenities include elevator."
+    # Even though text matches demo facts perfectly, validation fails because record is unverified!
+    ok, reason = validate_draft(grounded_text, demo_prop)
+    assert ok is False
+    assert "Unverified property record" in reason
+
+    imported_prop = dict(demo_prop, verified=False, provenance="imported")
+    ok, reason = validate_draft(grounded_text, imported_prop)
+    assert ok is False
+    assert "Unverified property record" in reason
+
+    unverified_prop = dict(demo_prop, verified=False, provenance="unverified")
+    ok, reason = validate_draft(grounded_text, unverified_prop)
+    assert ok is False
+    assert "Unverified property record" in reason
+
+    missing_provenance_prop = dict(demo_prop, verified=True, provenance="demo")
+    ok, reason = validate_draft(grounded_text, missing_provenance_prop)
+    assert ok is False
+    assert "Unverified property record" in reason
+
+    verified_prop = dict(demo_prop, verified=True, provenance="verified")
+    ok, reason = validate_draft(grounded_text, verified_prop)
+    assert ok is True
+    assert reason is None
